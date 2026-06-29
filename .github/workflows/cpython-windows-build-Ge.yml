@@ -96,8 +96,8 @@ jobs:
         run: |
           cd Python-${{ steps.vars.outputs.version }}\PCbuild
           call get_externals.bat
-          :: 【修改 2】：追加 /p:PlatformToolset=v143，强制 MSBuild 使用 VS 2022 工具链
-          call build.bat -p ${{ matrix.arch }} -c Release /p:PlatformToolset=v143
+          :: 使用双引号将参数包裹，防止 bat 脚本吃掉等号
+          call build.bat -p ${{ matrix.arch }} -c Release "/p:PlatformToolset=v143"
 
       - name: 整理输出并重命名 EXE
         shell: bash
