@@ -43,7 +43,6 @@ jobs:
         run: |
           $fileName = Split-Path $env:SOURCE_URL -Leaf
           Invoke-WebRequest -Uri $env:SOURCE_URL -OutFile $fileName
-          
           $base = $fileName -replace '\.tar\.(xz|gz|tgz)$',''
           @('.sigstore','.sig','.asc') | ForEach-Object { try { Invoke-WebRequest "$env:SOURCE_URL$_" "$base$_" -ErrorAction SilentlyContinue } catch {} }
           
@@ -52,7 +51,6 @@ jobs:
           } else {
             7z x $fileName -so | 7z x -si -ttar -oPython-src
           }
-          
           $srcDir = Get-ChildItem Python-src -Directory | Select-Object -First 1
           echo "PYTHON_SRC=$($srcDir.FullName)" >> $env:GITHUB_ENV
 
@@ -70,41 +68,49 @@ jobs:
         with:
           arch: ${{ matrix.arch_name }}
 
-      - name: Retarget Solution to VS 2022
+      - name: Retarget Toolset
         shell: pwsh
         working-directory: ${{ env.PYTHON_SRC }}
         run: |
-          # Replace toolset in all vcxproj
           Get-ChildItem -Recurse -Filter "*.vcxproj" | ForEach-Object {
-            $content = Get-Content $_.FullName -Raw
-            $content = $content -replace 'PlatformToolset>v140<', 'PlatformToolset>v143<'
-            $content = $content -replace 'v140', 'v143'
-            $content | Set-Content $_.FullName
+            $c = Get-Content $_.FullName -Raw
+            $c = $c -replace 'PlatformToolset>v140<', 'PlatformToolset>v143<'
+            $c = $c -replace 'v140', 'v143'
+            $c | Set-Content $_.FullName
           }
-          Write-Host "Retarget completed"
 
-      - name: Build Python
+      - name: Build Python core
         shell: cmd
         working-directory: ${{ env.PYTHON_SRC }}
         run: |
           cd PCbuild
           build.bat -e -p ${{ matrix.build_platform }} -c Release
 
-      - name: Build Installer
+      - name: Build Installer (with debug)
         shell: cmd
         working-directory: ${{ env.PYTHON_SRC }}
         run: |
           cd Tools\msi
+          dir
           build.bat -${{ matrix.arch_name }} --doc
+          dir en-us
 
-      - name: Collect
+      - name: Collect installer (debug)
         shell: pwsh
         run: |
-          $verMatch = Select-String "${env:PYTHON_SRC}\Include\patchlevel.h" -Pattern 'PY_VERSION\s+"([^"]+)"'
-          $version = $verMatch.Matches.Groups[1].Value
-          $installer = Get-ChildItem "${env:PYTHON_SRC}\Tools\msi\en-us" -Filter "python-*.exe" -Recurse | Select-Object -First 1
+          $src = $env:PYTHON_SRC
+          Write-Host "Looking for installers in $src\Tools\msi"
+          Get-ChildItem -Path "$src\Tools\msi" -Recurse -Filter "*.exe" | Write-Host
+          
+          $verMatch = Select-String -Path "$src\Include\patchlevel.h" -Pattern 'PY_VERSION\s+"([^"]+)"'
+          $version = if ($verMatch) { $verMatch.Matches.Groups[1].Value } else { "unknown" }
+          
+          $installer = Get-ChildItem "$src\Tools\msi\en-us" -Filter "python-*.exe" -Recurse | Select-Object -First 1
           if ($installer) {
             Copy-Item $installer.FullName "python-$version${{ matrix.suffix }}.exe" -Force
+            Write-Host "Success: python-$version${{ matrix.suffix }}.exe"
+          } else {
+            Write-Warning "No installer found"
           }
 
       - name: Upload
