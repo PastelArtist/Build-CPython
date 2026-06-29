@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_url:
-        description: 'Python source tarball URL (.tar.xz or .tgz)'
+        description: 'Python source URL (.tar.xz 或 .tgz)'
         required: true
         type: string
         default: 'https://www.python.org/ftp/python/3.11.15/Python-3.11.15.tar.xz'
@@ -16,7 +16,16 @@ jobs:
   build:
     strategy:
       matrix:
-        arch: [win32, amd64, arm64]
+        include:
+          - arch: win32
+            platform: Win32
+            suffix: ''
+          - arch: amd64
+            platform: x64
+            suffix: '-amd64'
+          - arch: arm64
+            platform: ARM64
+            suffix: '-arm64'
       fail-fast: false
     runs-on: windows-latest
     steps:
@@ -36,11 +45,11 @@ jobs:
           $fileName = Split-Path $env:SOURCE_URL -Leaf
           Invoke-WebRequest -Uri $env:SOURCE_URL -OutFile $fileName
           
-          # Download signatures
           $base = $fileName -replace '\.tar\.(xz|gz|tgz)$',''
-          @('.sigstore','.sig','.asc') | ForEach-Object { try { Invoke-WebRequest "$env:SOURCE_URL$_" -OutFile "$base$_" } catch {} }
+          @('.sigstore','.sig','.asc') | ForEach-Object { 
+            try { Invoke-WebRequest "$env:SOURCE_URL$_" "$base$_" -ErrorAction SilentlyContinue } catch {} 
+          }
           
-          # Extract
           if ($fileName -like "*.xz") {
             7z x $fileName -so | 7z x -si -ttar -oPython-src
           } else {
@@ -50,57 +59,59 @@ jobs:
           $srcDir = Get-ChildItem Python-src -Directory | Select-Object -First 1
           echo "PYTHON_SRC=$($srcDir.FullName)" >> $env:GITHUB_ENV
 
-      - name: Verify signature
+      - name: Verify Sigstore
         shell: pwsh
         run: |
           if (Test-Path "$env:PYTHON_SRC\..\*.sigstore") {
             pip install --quiet sigstore
             $tar = Get-ChildItem "$env:PYTHON_SRC\.." -Filter "Python*.tar*" | Select-Object -First 1
-            python -m sigstore verify identity --bundle "$($tar.Name).sigstore" --cert-identity "pablogsal@python.org" --cert-oidc-issuer "https://accounts.google.com" "$($tar.Name)"
+            python -m sigstore verify identity `
+              --bundle "$($tar.Name).sigstore" `
+              --cert-identity "pablogsal@python.org" `
+              --cert-oidc-issuer "https://accounts.google.com" `
+              "$($tar.Name)"
           }
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
-          arch: ${{ matrix.arch == 'win32' && 'x86' || (matrix.arch == 'amd64' && 'x64' || 'arm64') }}
+          arch: ${{ matrix.arch }}
 
-      - name: Retarget to current VS toolset
+      - name: Retarget VS Toolset
         shell: pwsh
         working-directory: ${{ env.PYTHON_SRC }}
         run: |
-          # Upgrade all .vcxproj to current toolset (v143 or v144)
           Get-ChildItem -Recurse -Filter "*.vcxproj" | ForEach-Object {
-            (Get-Content $_.FullName) -replace 'v140', 'v143' | Set-Content $_.FullName
+            (Get-Content $_ -Raw) -replace 'v140', 'v143' | Set-Content $_
           }
-          Write-Host "Retargeted projects to v143 toolset"
 
-      - name: Build Python core
+      - name: Build Python
         shell: cmd
         working-directory: ${{ env.PYTHON_SRC }}
         run: |
           cd PCbuild
-          build.bat -e -p ${{ matrix.arch == 'win32' && 'Win32' || matrix.arch }} -c Release
+          build.bat -e -p ${{ matrix.platform }} -c Release
 
       - name: Build Installer
         shell: cmd
         working-directory: ${{ env.PYTHON_SRC }}
         run: |
           cd Tools\msi
-          build.bat -${{ matrix.arch == 'win32' && 'x86' || matrix.arch }} --doc
+          build.bat -${{ matrix.arch }} --doc
 
-      - name: Collect installer
+      - name: Collect & Rename
         shell: pwsh
         run: |
-          $versionMatch = Select-String -Path "${env:PYTHON_SRC}\Include\patchlevel.h" -Pattern 'PY_VERSION\s+"([^"]+)"'
-          $version = if ($versionMatch) { $versionMatch.Matches.Groups[1].Value } else { "unknown" }
-          $suffix = @{win32=''; amd64='-amd64'; arm64='-arm64'}[$env:MATRIX_ARCH]
+          $verMatch = Select-String -Path "${env:PYTHON_SRC}\Include\patchlevel.h" -Pattern 'PY_VERSION\s+"([^"]+)"'
+          $version = if ($verMatch) { $verMatch.Matches.Groups[1].Value } else { "unknown" }
           
           $installer = Get-ChildItem "${env:PYTHON_SRC}\Tools\msi\en-us" -Filter "python-*.exe" -Recurse | Select-Object -First 1
           if ($installer) {
-            Copy-Item $installer.FullName "python-$version$suffix.exe" -Force
+            Copy-Item $installer.FullName "python-$version${{ matrix.suffix }}.exe" -Force
+            Write-Host "python-$version${{ matrix.suffix }}.exe"
           }
 
-      - name: Upload artifact
+      - name: Upload
         uses: actions/upload-artifact@v7
         with:
           name: python-installer-${{ matrix.arch }}
