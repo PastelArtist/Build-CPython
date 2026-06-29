@@ -96,7 +96,7 @@ jobs:
           sha256sum "$ARCHIVE_NAME"
 
   build-x86:
-    runs-on: windows-latest
+    runs-on: windows-2022
     needs: prepare
     steps:
       - name: Download CPython source
@@ -195,14 +195,14 @@ jobs:
           Get-Item $OutputName | Format-List Name, Length
 
       - name: Upload x86 artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cpython-x86
           path: python-${{ needs.prepare.outputs.version }}.exe
           retention-days: 30
 
   build-x64:
-    runs-on: windows-latest
+    runs-on: windows-2022
     needs: prepare
     steps:
       - name: Download CPython source
@@ -287,14 +287,14 @@ jobs:
           Write-Host "Created: $OutputName"
 
       - name: Upload x64 artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cpython-x64
           path: python-${{ needs.prepare.outputs.version }}-amd64.exe
           retention-days: 30
 
   build-arm64:
-    runs-on: windows-latest
+    runs-on: windows-2022
     needs: prepare
     steps:
       - name: Download CPython source
@@ -378,7 +378,7 @@ jobs:
           Write-Host "Created: $OutputName"
 
       - name: Upload ARM64 artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cpython-arm64
           path: python-${{ needs.prepare.outputs.version }}-arm64.exe
@@ -410,7 +410,7 @@ jobs:
           ls -lh release_files/
 
       - name: Upload combined artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cpython-${{ needs.prepare.outputs.version }}-all
           path: release_files/
