@@ -1,0 +1,100 @@
+name: Build CPython Windows Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: 'CPython 源码链接 (.tar.xz 或 .tgz)'
+        required: true
+        type: string
+        default: 'https://www.python.org/ftp/python/3.11.15/Python-3.11.15.tar.xz'
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [Win32, x64, ARM64]
+
+    steps:
+      - name: 解析 URL 及环境变量
+        id: vars
+        shell: bash
+        run: |
+          URL="${{ github.event.inputs.source_url }}"
+          FILENAME=$(basename "$URL")
+          # 提取版本号 (支持 .tar.xz 和 .tgz)
+          VERSION=$(echo "$FILENAME" | sed -E 's/^Python-(.+)\.(tar\.xz|tgz)$/\1/')
+          
+          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          
+          # 映射输出文件名和 CPython PCbuild 的输出目录
+          if [[ "${{ matrix.arch }}" == "Win32" ]]; then
+            echo "out_name=python-${VERSION}.exe" >> $GITHUB_OUTPUT
+            echo "build_dir=win32" >> $GITHUB_OUTPUT
+          elif [[ "${{ matrix.arch }}" == "x64" ]]; then
+            echo "out_name=python-${VERSION}-amd64.exe" >> $GITHUB_OUTPUT
+            echo "build_dir=amd64" >> $GITHUB_OUTPUT
+          elif [[ "${{ matrix.arch }}" == "ARM64" ]]; then
+            # 注意：如果输入是 3.11.9，这里会自动生成 python-3.11.9-arm64.exe
+            echo "out_name=python-${VERSION}-arm64.exe" >> $GITHUB_OUTPUT
+            echo "build_dir=arm64" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 下载源码与 GPG 签名文件
+        shell: bash
+        run: |
+          URL="${{ github.event.inputs.source_url }}"
+          # 下载源码包
+          curl -L -O "$URL"
+          # 下载对应的 .asc 签名文件
+          curl -L -O "${URL}.asc"
+          # 下载 Python 官方公钥集合（包含所有历史发布者的 Key）
+          curl -L -o pubkeys.txt https://www.python.org/static/files/pubkeys.txt
+
+      - name: 验证源码签名
+        shell: bash
+        run: |
+          # 导入所有官方发布者的 GPG 公钥
+          gpg --import pubkeys.txt
+          # 验证下载的源码包
+          gpg --verify "${{ steps.vars.outputs.filename }}.asc" "${{ steps.vars.outputs.filename }}"
+
+      - name: 解压源码
+        shell: bash
+        run: |
+          # Windows 上的 tar 原生支持解压 .tar.xz 和 .tgz
+          tar -xf "${{ steps.vars.outputs.filename }}"
+
+      - name: 编译 CPython
+        shell: cmd
+        run: |
+          cd Python-${{ steps.vars.outputs.version }}\PCbuild
+          :: 下载 Windows 编译所需的外部依赖 (如 OpenSSL, SQLite, bzip2 等)
+          call get_externals.bat
+          :: 调用官方脚本进行 Release 编译
+          call build.bat -p ${{ matrix.arch }} -c Release
+
+      - name: 整理输出并重命名 EXE
+        shell: bash
+        run: |
+          VERSION="${{ steps.vars.outputs.version }}"
+          BUILD_DIR="Python-${VERSION}/PCbuild/${{ steps.vars.outputs.build_dir }}"
+          OUT_NAME="${{ steps.vars.outputs.out_name }}"
+          
+          mkdir output_artifact
+          # 复制并重命名主程序为要求的格式
+          cp "${BUILD_DIR}/python.exe" "output_artifact/${OUT_NAME}"
+          
+          # CPython 主程序强依赖于 python3x.dll，必须一起打包才能在本地运行
+          cp ${BUILD_DIR}/*.dll output_artifact/ || true
+          cp "${BUILD_DIR}/pythonw.exe" "output_artifact/" || true
+
+      - name: 上传编译产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.vars.outputs.out_name }}-bundle
+          path: output_artifact/*
