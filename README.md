@@ -1,0 +1,2 @@
+# Build-CPython
+build cpython
