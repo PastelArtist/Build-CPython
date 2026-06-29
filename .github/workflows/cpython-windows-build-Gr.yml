@@ -17,14 +17,14 @@ jobs:
     strategy:
       matrix:
         include:
-          - arch: win32
-            platform: Win32
+          - arch_name: win32
+            build_platform: Win32
             suffix: ''
-          - arch: amd64
-            platform: x64
+          - arch_name: amd64
+            build_platform: x64
             suffix: '-amd64'
-          - arch: arm64
-            platform: ARM64
+          - arch_name: arm64
+            build_platform: ARM64
             suffix: '-arm64'
       fail-fast: false
     runs-on: windows-latest
@@ -38,7 +38,6 @@ jobs:
 
       - name: Download & Extract
         shell: pwsh
-        id: extract
         env:
           SOURCE_URL: ${{ inputs.source_url }}
         run: |
@@ -47,7 +46,7 @@ jobs:
           
           $base = $fileName -replace '\.tar\.(xz|gz|tgz)$',''
           @('.sigstore','.sig','.asc') | ForEach-Object { 
-            try { Invoke-WebRequest "$env:SOURCE_URL$_" "$base$_" -ErrorAction SilentlyContinue } catch {} 
+            try { Invoke-WebRequest -Uri "$env:SOURCE_URL$_" -OutFile "$base$_" -ErrorAction SilentlyContinue } catch {} 
           }
           
           if ($fileName -like "*.xz") {
@@ -56,10 +55,10 @@ jobs:
             7z x $fileName -so | 7z x -si -ttar -oPython-src
           }
           
-          $srcDir = Get-ChildItem Python-src -Directory | Select-Object -First 1
+          $srcDir = Get-ChildItem -Path "Python-src" -Directory | Select-Object -First 1
           echo "PYTHON_SRC=$($srcDir.FullName)" >> $env:GITHUB_ENV
 
-      - name: Verify Sigstore
+      - name: Verify signature
         shell: pwsh
         run: |
           if (Test-Path "$env:PYTHON_SRC\..\*.sigstore") {
@@ -75,14 +74,14 @@ jobs:
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
-          arch: ${{ matrix.arch }}
+          arch: ${{ matrix.arch_name }}
 
-      - name: Retarget VS Toolset
+      - name: Retarget Toolset
         shell: pwsh
         working-directory: ${{ env.PYTHON_SRC }}
         run: |
           Get-ChildItem -Recurse -Filter "*.vcxproj" | ForEach-Object {
-            (Get-Content $_ -Raw) -replace 'v140', 'v143' | Set-Content $_
+            (Get-Content $_.FullName -Raw) -replace 'v140', 'v143' | Set-Content $_.FullName
           }
 
       - name: Build Python
@@ -90,29 +89,26 @@ jobs:
         working-directory: ${{ env.PYTHON_SRC }}
         run: |
           cd PCbuild
-          build.bat -e -p ${{ matrix.platform }} -c Release
+          build.bat -e -p ${{ matrix.build_platform }} -c Release
 
       - name: Build Installer
         shell: cmd
         working-directory: ${{ env.PYTHON_SRC }}
         run: |
           cd Tools\msi
-          build.bat -${{ matrix.arch }} --doc
+          build.bat -${{ matrix.arch_name }} --doc
 
-      - name: Collect & Rename
+      - name: Collect installer
         shell: pwsh
         run: |
-          $verMatch = Select-String -Path "${env:PYTHON_SRC}\Include\patchlevel.h" -Pattern 'PY_VERSION\s+"([^"]+)"'
-          $version = if ($verMatch) { $verMatch.Matches.Groups[1].Value } else { "unknown" }
-          
+          $ver = (Select-String -Path "${env:PYTHON_SRC}\Include\patchlevel.h" -Pattern 'PY_VERSION\s+"([^"]+)"').Matches.Groups[1].Value
           $installer = Get-ChildItem "${env:PYTHON_SRC}\Tools\msi\en-us" -Filter "python-*.exe" -Recurse | Select-Object -First 1
           if ($installer) {
-            Copy-Item $installer.FullName "python-$version${{ matrix.suffix }}.exe" -Force
-            Write-Host "python-$version${{ matrix.suffix }}.exe"
+            Copy-Item $installer.FullName "python-$ver${{ matrix.suffix }}.exe" -Force
           }
 
       - name: Upload
         uses: actions/upload-artifact@v7
         with:
-          name: python-installer-${{ matrix.arch }}
+          name: python-installer-${{ matrix.arch_name }}
           path: python-*.exe
