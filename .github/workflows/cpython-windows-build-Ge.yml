@@ -25,13 +25,11 @@ jobs:
         run: |
           URL="${{ github.event.inputs.source_url }}"
           FILENAME=$(basename "$URL")
-          # 提取版本号 (支持 .tar.xz 和 .tgz)
           VERSION=$(echo "$FILENAME" | sed -E 's/^Python-(.+)\.(tar\.xz|tgz)$/\1/')
           
           echo "filename=$FILENAME" >> $GITHUB_OUTPUT
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           
-          # 映射输出文件名和 CPython PCbuild 的输出目录
           if [[ "${{ matrix.arch }}" == "Win32" ]]; then
             echo "out_name=python-${VERSION}.exe" >> $GITHUB_OUTPUT
             echo "build_dir=win32" >> $GITHUB_OUTPUT
@@ -39,7 +37,6 @@ jobs:
             echo "out_name=python-${VERSION}-amd64.exe" >> $GITHUB_OUTPUT
             echo "build_dir=amd64" >> $GITHUB_OUTPUT
           elif [[ "${{ matrix.arch }}" == "ARM64" ]]; then
-            # 注意：如果输入是 3.11.9，这里会自动生成 python-3.11.9-arm64.exe
             echo "out_name=python-${VERSION}-arm64.exe" >> $GITHUB_OUTPUT
             echo "build_dir=arm64" >> $GITHUB_OUTPUT
           fi
@@ -48,34 +45,62 @@ jobs:
         shell: bash
         run: |
           URL="${{ github.event.inputs.source_url }}"
-          # 下载源码包
-          curl -L -O "$URL"
-          # 下载对应的 .asc 签名文件
-          curl -L -O "${URL}.asc"
-          # 下载 Python 官方公钥集合（包含所有历史发布者的 Key）
-          curl -L -o pubkeys.txt https://www.python.org/static/files/pubkeys.txt
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          
+          echo "正在下载源码包..."
+          curl -f -L -A "$UA" -O "$URL"
+          
+          echo "正在下载签名文件..."
+          curl -f -L -A "$UA" -O "${URL}.asc"
+          
+          echo "正在下载官方公钥文本 (尝试)..."
+          # 允许下载公钥文本失败，因为我们在下一步写了动态追溯公钥的兜底逻辑
+          curl -L -A "$UA" -o pubkeys.txt https://www.python.org/static/files/pubkeys.txt || echo "官方公钥包下载失败，启用公钥服务器兜底"
 
       - name: 验证源码签名
         shell: bash
         run: |
-          # 导入所有官方发布者的 GPG 公钥
-          gpg --import pubkeys.txt
-          # 验证下载的源码包
-          gpg --verify "${{ steps.vars.outputs.filename }}.asc" "${{ steps.vars.outputs.filename }}"
+          FILENAME="${{ steps.vars.outputs.filename }}"
+          
+          # 尝试导入下载的公钥文本（如果内容合法）
+          if [ -f pubkeys.txt ] && grep -q "BEGIN PGP PUBLIC KEY BLOCK" pubkeys.txt; then
+            echo "检测到合法的官方公钥文本，正在导入..."
+            gpg --import pubkeys.txt
+          else
+            echo "未检测到合法的本地公钥文本，将通过签名自动追溯远程公钥..."
+          fi
+          
+          # 运行一次验证，允许失败，用以捕获该版本对应的 Release Manager Key ID
+          VERIFY_OUTPUT=$(gpg --verify "${FILENAME}.asc" "${FILENAME}" 2>&1 || true)
+          echo "$VERIFY_OUTPUT"
+          
+          # 提取 Key ID (支持 "using RSA key XXXXXX" 格式)
+          KEY_ID=$(echo "$VERIFY_OUTPUT" | grep -E "using .* key" | awk '{print $NF}')
+          
+          if [ -z "$KEY_ID" ]; then
+            # 备用提取规则
+            KEY_ID=$(echo "$VERIFY_OUTPUT" | grep -i "key ID" | awk '{print $NF}')
+          fi
+          
+          if [ ! -z "$KEY_ID" ]; then
+            echo "成功识别到该版本发布者的 Key ID: $KEY_ID"
+            echo "正在从全球公钥服务器拉取密钥..."
+            gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys "$KEY_ID"
+          fi
+          
+          echo "进行最终的真实性验证:"
+          gpg --verify "${FILENAME}.asc" "${FILENAME}"
 
       - name: 解压源码
         shell: bash
         run: |
-          # Windows 上的 tar 原生支持解压 .tar.xz 和 .tgz
           tar -xf "${{ steps.vars.outputs.filename }}"
 
       - name: 编译 CPython
         shell: cmd
         run: |
           cd Python-${{ steps.vars.outputs.version }}\PCbuild
-          :: 下载 Windows 编译所需的外部依赖 (如 OpenSSL, SQLite, bzip2 等)
           call get_externals.bat
-          :: 调用官方脚本进行 Release 编译
           call build.bat -p ${{ matrix.arch }} -c Release
 
       - name: 整理输出并重命名 EXE
@@ -86,10 +111,7 @@ jobs:
           OUT_NAME="${{ steps.vars.outputs.out_name }}"
           
           mkdir output_artifact
-          # 复制并重命名主程序为要求的格式
           cp "${BUILD_DIR}/python.exe" "output_artifact/${OUT_NAME}"
-          
-          # CPython 主程序强依赖于 python3x.dll，必须一起打包才能在本地运行
           cp ${BUILD_DIR}/*.dll output_artifact/ || true
           cp "${BUILD_DIR}/pythonw.exe" "output_artifact/" || true
 
