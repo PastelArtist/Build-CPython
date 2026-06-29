@@ -41,13 +41,12 @@ jobs:
           
           VERSION=$(echo "$ARCHIVE_NAME" | sed -E 's/Python-([0-9]+\.[0-9]+\.[0-9]+)\.(tar\.xz|tgz)/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          
-          echo "Archive: $ARCHIVE_NAME"
-          echo "Version: $VERSION"
 
   download-and-verify:
     runs-on: ubuntu-latest
     needs: prepare
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
     steps:
       - name: Download CPython source
         run: |
@@ -65,12 +64,13 @@ jobs:
           wget -q "$BASE_URL/$ARCHIVE_NAME.asc" || echo "No .asc file found"
           ls -lh $ARCHIVE_NAME* 2>/dev/null
 
-      - name: Import GPG keys from keyserver
+      - name: Import GPG keys
         run: |
           echo "Importing GPG keys..."
           
           gpg --keyserver keys.openpgp.org --recv-keys CFDCA245B1043CF2A5F97865FFE87404168BD847 2>&1 || \
-          gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys CFDCA245B1043CF2A5F97865FFE87404168BD847 2>&1 || true
+          gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys CFDCA245B1043CF2A5F97865FFE87404168BD847 2>&1 || \
+          echo "Primary key not found, trying fallback keys..."
           
           gpg --keyserver keys.openpgp.org --recv-keys \
             0D96DF4D4110E5C1A2A4B132C3A8495E0E31E23B \
@@ -85,48 +85,78 @@ jobs:
           ARCHIVE_NAME=$(basename "${{ github.event.inputs.source_url }}")
           
           if [ -f "$ARCHIVE_NAME.asc" ]; then
-            echo "Verifying signature..."
-            gpg --verify "$ARCHIVE_NAME.asc" "$ARCHIVE_NAME" || true
+            echo "Verifying GPG signature..."
+            if gpg --verify "$ARCHIVE_NAME.asc" "$ARCHIVE_NAME" 2>&1; then
+              echo "GPG signature verification PASSED"
+            else
+              echo "GPG signature verification FAILED (but continuing...)"
+            fi
+          else
+            echo "No .asc signature file found"
           fi
 
       - name: Calculate source hash
+        id: hash
         run: |
           cd /tmp
           ARCHIVE_NAME=$(basename "${{ github.event.inputs.source_url }}")
-          sha256sum "$ARCHIVE_NAME"
+          SHA256=$(sha256sum "$ARCHIVE_NAME" | awk '{print $1}')
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "SHA256: $SHA256"
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: cpython-source-archive
+          path: /tmp/${{ needs.prepare.outputs.archive_name }}
+          retention-days: 1
 
   build-x86:
     runs-on: windows-2022
-    needs: prepare
+    needs: [prepare, download-and-verify]
     steps:
-      - name: Download CPython source
+      - name: Download verified source archive
+        uses: actions/download-artifact@v4
+        with:
+          name: cpython-source-archive
+          path: ${{ env.TEMP }}
+
+      - name: Verify archive integrity on Windows
         run: |
-          $SourceUrl = "${{ github.event.inputs.source_url }}"
-          $ArchiveName = Split-Path -Leaf $SourceUrl
-          $OutputPath = Join-Path $env:TEMP $ArchiveName
+          $ArchivePath = Join-Path $env:TEMP "${{ needs.prepare.outputs.archive_name }}"
           
-          Write-Host "Downloading from: $SourceUrl"
-          Invoke-WebRequest -Uri $SourceUrl -OutFile $OutputPath -UseBasicParsing
-          Write-Host "Downloaded: $ArchiveName"
+          Write-Host "Computing SHA256..."
+          $CurrentHash = (Get-FileHash -Path $ArchivePath -Algorithm SHA256).Hash.ToLower()
+          $ExpectedHash = "${{ needs.download-and-verify.outputs.sha256 }}".ToLower()
+          
+          Write-Host "Expected: $ExpectedHash"
+          Write-Host "Current:  $CurrentHash"
+          
+          if ($CurrentHash -eq $ExpectedHash) {
+            Write-Host "Archive integrity verified!"
+          } else {
+            Write-Host "Archive integrity check FAILED!"
+            exit 1
+          }
 
       - name: Extract source
         run: |
-          $ArchiveName = Split-Path -Leaf "${{ github.event.inputs.source_url }}"
+          $ArchiveName = "${{ needs.prepare.outputs.archive_name }}"
           $OutputPath = Join-Path $env:TEMP $ArchiveName
           
           if ($ArchiveName -like "*.tar.xz") {
             tar -xf $OutputPath -C $env:TEMP
-          } elseif ($ArchiveName -like "*.tgz") {
+          } else {
             tar -xzf $OutputPath -C $env:TEMP
           }
 
-      - name: Locate CPython source directory
-        id: source
+      - name: Locate source directory
+        id: build
         run: |
           $PythonDirs = @(Get-ChildItem $env:TEMP -Directory -Filter "Python-*" -ErrorAction SilentlyContinue)
-          if ($PythonDirs.Count -eq 0) {
+          if ($PythonDirs.Count -eq 0) { 
             Write-Host "ERROR: No Python-* directory found"
-            exit 1
+            exit 1 
           }
           
           $SourceDir = $PythonDirs[0].FullName
@@ -135,66 +165,45 @@ jobs:
 
       - name: Build CPython x86 (Win32)
         run: |
-          $SourceDir = "${{ steps.source.outputs.source_dir }}"
+          $SourceDir = "${{ steps.build.outputs.source_dir }}"
           $PcbuildDir = Join-Path $SourceDir "PCbuild"
           
           Write-Host "Building x86 (Win32)..."
           cd $PcbuildDir
-          
-          # Run build.bat with release mode and Win32 platform
           & cmd /c "build.bat -d -p Win32"
           
-          if ($LASTEXITCODE -ne 0) {
+          if ($LASTEXITCODE -ne 0) { 
             Write-Host "Build failed with exit code: $LASTEXITCODE"
-            exit 1
+            exit 1 
           }
-          Write-Host "Build completed successfully"
+          Write-Host "Build successful"
 
-      - name: Locate x86 python.exe
-        id: exe_x86
+      - name: Locate x86 executable
+        id: exe
         run: |
-          $SourceDir = "${{ steps.source.outputs.source_dir }}"
+          $SourceDir = "${{ steps.build.outputs.source_dir }}"
           $PcbuildDir = Join-Path $SourceDir "PCbuild"
           
-          # Search for python.exe in common build output locations
-          $SearchPaths = @(
-            (Join-Path $PcbuildDir "win32\python.exe"),
-            (Join-Path $PcbuildDir "win32\Release\python.exe"),
-            (Join-Path $PcbuildDir "win32\Debug\python.exe"),
-            (Join-Path $PcbuildDir "amd64\python.exe"),
-            (Join-Path $PcbuildDir "amd64\Release\python.exe")
-          )
-          
-          $ExePath = $null
-          foreach ($path in $SearchPaths) {
-            if (Test-Path $path) {
-              $ExePath = $path
-              Write-Host "Found: $ExePath"
-              break
-            }
+          $ExePath = Get-ChildItem $PcbuildDir -Recurse -Filter "python.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $ExePath) { 
+            Write-Host "ERROR: python.exe not found"
+            exit 1 
           }
           
-          if (-not $ExePath) {
-            Write-Host "Searching for all python.exe files..."
-            Get-ChildItem $PcbuildDir -Recurse -Filter "python.exe" -ErrorAction SilentlyContinue | ForEach-Object {
-              Write-Host "Available: $($_.FullName)"
-            }
-            exit 1
-          }
-          
-          echo "exe_path=$ExePath" >> $env:GITHUB_OUTPUT
+          Write-Host "Found: $($ExePath.FullName)"
+          echo "exe_path=$($ExePath.FullName)" >> $env:GITHUB_OUTPUT
 
-      - name: Copy x86 executable
+      - name: Copy executable
         run: |
-          $ExePath = "${{ steps.exe_x86.outputs.exe_path }}"
           $Version = "${{ needs.prepare.outputs.version }}"
+          $ExePath = "${{ steps.exe.outputs.exe_path }}"
           $OutputName = "python-$Version.exe"
           
           Copy-Item $ExePath $OutputName -Force
           Write-Host "Created: $OutputName"
-          Get-Item $OutputName | Format-List Name, Length
+          Get-Item $OutputName | Select-Object Name, Length
 
-      - name: Upload x86 artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: cpython-x86
@@ -203,28 +212,45 @@ jobs:
 
   build-x64:
     runs-on: windows-2022
-    needs: prepare
+    needs: [prepare, download-and-verify]
     steps:
-      - name: Download CPython source
+      - name: Download verified source archive
+        uses: actions/download-artifact@v4
+        with:
+          name: cpython-source-archive
+          path: ${{ env.TEMP }}
+
+      - name: Verify archive integrity on Windows
         run: |
-          $SourceUrl = "${{ github.event.inputs.source_url }}"
-          $ArchiveName = Split-Path -Leaf $SourceUrl
-          $OutputPath = Join-Path $env:TEMP $ArchiveName
-          Invoke-WebRequest -Uri $SourceUrl -OutFile $OutputPath -UseBasicParsing
+          $ArchivePath = Join-Path $env:TEMP "${{ needs.prepare.outputs.archive_name }}"
+          
+          Write-Host "Computing SHA256..."
+          $CurrentHash = (Get-FileHash -Path $ArchivePath -Algorithm SHA256).Hash.ToLower()
+          $ExpectedHash = "${{ needs.download-and-verify.outputs.sha256 }}".ToLower()
+          
+          Write-Host "Expected: $ExpectedHash"
+          Write-Host "Current:  $CurrentHash"
+          
+          if ($CurrentHash -eq $ExpectedHash) {
+            Write-Host "Archive integrity verified!"
+          } else {
+            Write-Host "Archive integrity check FAILED!"
+            exit 1
+          }
 
       - name: Extract source
         run: |
-          $ArchiveName = Split-Path -Leaf "${{ github.event.inputs.source_url }}"
+          $ArchiveName = "${{ needs.prepare.outputs.archive_name }}"
           $OutputPath = Join-Path $env:TEMP $ArchiveName
           
           if ($ArchiveName -like "*.tar.xz") {
             tar -xf $OutputPath -C $env:TEMP
-          } elseif ($ArchiveName -like "*.tgz") {
+          } else {
             tar -xzf $OutputPath -C $env:TEMP
           }
 
-      - name: Locate CPython source directory
-        id: source
+      - name: Locate source directory
+        id: build
         run: |
           $PythonDirs = @(Get-ChildItem $env:TEMP -Directory -Filter "Python-*" -ErrorAction SilentlyContinue)
           if ($PythonDirs.Count -eq 0) { exit 1 }
@@ -232,61 +258,33 @@ jobs:
 
       - name: Build CPython x64
         run: |
-          $SourceDir = "${{ steps.source.outputs.source_dir }}"
+          $SourceDir = "${{ steps.build.outputs.source_dir }}"
           $PcbuildDir = Join-Path $SourceDir "PCbuild"
           
           Write-Host "Building x64..."
           cd $PcbuildDir
-          
           & cmd /c "build.bat -d -p x64"
           
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "Build failed"
-            exit 1
-          }
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Write-Host "Build successful"
 
-      - name: Locate x64 python.exe
-        id: exe_x64
+      - name: Locate x64 executable
+        id: exe
         run: |
-          $SourceDir = "${{ steps.source.outputs.source_dir }}"
+          $SourceDir = "${{ steps.build.outputs.source_dir }}"
           $PcbuildDir = Join-Path $SourceDir "PCbuild"
           
-          $SearchPaths = @(
-            (Join-Path $PcbuildDir "amd64\python.exe"),
-            (Join-Path $PcbuildDir "amd64\Release\python.exe"),
-            (Join-Path $PcbuildDir "amd64\Debug\python.exe"),
-            (Join-Path $PcbuildDir "x64\python.exe")
-          )
+          $ExePath = Get-ChildItem $PcbuildDir -Recurse -Filter "python.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $ExePath) { exit 1 }
           
-          $ExePath = $null
-          foreach ($path in $SearchPaths) {
-            if (Test-Path $path) {
-              $ExePath = $path
-              Write-Host "Found: $ExePath"
-              break
-            }
-          }
-          
-          if (-not $ExePath) {
-            Write-Host "Searching for all python.exe files..."
-            Get-ChildItem $PcbuildDir -Recurse -Filter "python.exe" | ForEach-Object {
-              Write-Host "Available: $($_.FullName)"
-            }
-            exit 1
-          }
-          
-          echo "exe_path=$ExePath" >> $env:GITHUB_OUTPUT
+          echo "exe_path=$($ExePath.FullName)" >> $env:GITHUB_OUTPUT
 
-      - name: Copy x64 executable
+      - name: Copy executable
         run: |
-          $ExePath = "${{ steps.exe_x64.outputs.exe_path }}"
           $Version = "${{ needs.prepare.outputs.version }}"
-          $OutputName = "python-$Version-amd64.exe"
-          
-          Copy-Item $ExePath $OutputName -Force
-          Write-Host "Created: $OutputName"
+          Copy-Item "${{ steps.exe.outputs.exe_path }}" "python-$Version-amd64.exe" -Force
 
-      - name: Upload x64 artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: cpython-x64
@@ -295,28 +293,45 @@ jobs:
 
   build-arm64:
     runs-on: windows-2022
-    needs: prepare
+    needs: [prepare, download-and-verify]
     steps:
-      - name: Download CPython source
+      - name: Download verified source archive
+        uses: actions/download-artifact@v4
+        with:
+          name: cpython-source-archive
+          path: ${{ env.TEMP }}
+
+      - name: Verify archive integrity on Windows
         run: |
-          $SourceUrl = "${{ github.event.inputs.source_url }}"
-          $ArchiveName = Split-Path -Leaf $SourceUrl
-          $OutputPath = Join-Path $env:TEMP $ArchiveName
-          Invoke-WebRequest -Uri $SourceUrl -OutFile $OutputPath -UseBasicParsing
+          $ArchivePath = Join-Path $env:TEMP "${{ needs.prepare.outputs.archive_name }}"
+          
+          Write-Host "Computing SHA256..."
+          $CurrentHash = (Get-FileHash -Path $ArchivePath -Algorithm SHA256).Hash.ToLower()
+          $ExpectedHash = "${{ needs.download-and-verify.outputs.sha256 }}".ToLower()
+          
+          Write-Host "Expected: $ExpectedHash"
+          Write-Host "Current:  $CurrentHash"
+          
+          if ($CurrentHash -eq $ExpectedHash) {
+            Write-Host "Archive integrity verified!"
+          } else {
+            Write-Host "Archive integrity check FAILED!"
+            exit 1
+          }
 
       - name: Extract source
         run: |
-          $ArchiveName = Split-Path -Leaf "${{ github.event.inputs.source_url }}"
+          $ArchiveName = "${{ needs.prepare.outputs.archive_name }}"
           $OutputPath = Join-Path $env:TEMP $ArchiveName
           
           if ($ArchiveName -like "*.tar.xz") {
             tar -xf $OutputPath -C $env:TEMP
-          } elseif ($ArchiveName -like "*.tgz") {
+          } else {
             tar -xzf $OutputPath -C $env:TEMP
           }
 
-      - name: Locate CPython source directory
-        id: source
+      - name: Locate source directory
+        id: build
         run: |
           $PythonDirs = @(Get-ChildItem $env:TEMP -Directory -Filter "Python-*" -ErrorAction SilentlyContinue)
           if ($PythonDirs.Count -eq 0) { exit 1 }
@@ -324,60 +339,33 @@ jobs:
 
       - name: Build CPython ARM64
         run: |
-          $SourceDir = "${{ steps.source.outputs.source_dir }}"
+          $SourceDir = "${{ steps.build.outputs.source_dir }}"
           $PcbuildDir = Join-Path $SourceDir "PCbuild"
           
           Write-Host "Building ARM64..."
           cd $PcbuildDir
-          
           & cmd /c "build.bat -d -p ARM64"
           
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "Build failed"
-            exit 1
-          }
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Write-Host "Build successful"
 
-      - name: Locate ARM64 python.exe
-        id: exe_arm64
+      - name: Locate ARM64 executable
+        id: exe
         run: |
-          $SourceDir = "${{ steps.source.outputs.source_dir }}"
+          $SourceDir = "${{ steps.build.outputs.source_dir }}"
           $PcbuildDir = Join-Path $SourceDir "PCbuild"
           
-          $SearchPaths = @(
-            (Join-Path $PcbuildDir "arm64\python.exe"),
-            (Join-Path $PcbuildDir "arm64\Release\python.exe"),
-            (Join-Path $PcbuildDir "arm64\Debug\python.exe")
-          )
+          $ExePath = Get-ChildItem $PcbuildDir -Recurse -Filter "python.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $ExePath) { exit 1 }
           
-          $ExePath = $null
-          foreach ($path in $SearchPaths) {
-            if (Test-Path $path) {
-              $ExePath = $path
-              Write-Host "Found: $ExePath"
-              break
-            }
-          }
-          
-          if (-not $ExePath) {
-            Write-Host "Searching for all python.exe files..."
-            Get-ChildItem $PcbuildDir -Recurse -Filter "python.exe" | ForEach-Object {
-              Write-Host "Available: $($_.FullName)"
-            }
-            exit 1
-          }
-          
-          echo "exe_path=$ExePath" >> $env:GITHUB_OUTPUT
+          echo "exe_path=$($ExePath.FullName)" >> $env:GITHUB_OUTPUT
 
-      - name: Copy ARM64 executable
+      - name: Copy executable
         run: |
-          $ExePath = "${{ steps.exe_arm64.outputs.exe_path }}"
           $Version = "${{ needs.prepare.outputs.version }}"
-          $OutputName = "python-$Version-arm64.exe"
-          
-          Copy-Item $ExePath $OutputName -Force
-          Write-Host "Created: $OutputName"
+          Copy-Item "${{ steps.exe.outputs.exe_path }}" "python-$Version-arm64.exe" -Force
 
-      - name: Upload ARM64 artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: cpython-arm64
@@ -397,16 +385,9 @@ jobs:
       - name: Organize artifacts
         run: |
           mkdir -p release_files
+          find release_artifacts -name "*.exe" -exec cp {} release_files/ \;
           
-          echo "=== All downloaded artifacts ==="
-          find release_artifacts -type f -name "*.exe" -exec ls -lh {} \;
-          
-          echo ""
-          echo "=== Copying to release_files ==="
-          find release_artifacts -type f -name "*.exe" -exec cp {} release_files/ \;
-          
-          echo ""
-          echo "=== Final Release Files ==="
+          echo "=== Final Release Files ===" 
           ls -lh release_files/
 
       - name: Upload combined artifacts
@@ -417,16 +398,15 @@ jobs:
           retention-days: 90
 
       - name: Generate summary
-        if: always()
         run: |
-          echo "## CPython ${{ needs.prepare.outputs.version }} Build Complete" >> $GITHUB_STEP_SUMMARY
+          echo "## CPython ${{ needs.prepare.outputs.version }} Build Complete ✓" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Source**: ${{ github.event.inputs.source_url }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Generated Executables:" >> $GITHUB_STEP_SUMMARY
           
           if [ -d "release_files" ] && [ -n "$(ls -A release_files/)" ]; then
-            ls -1 release_files/ | sed 's/^/- /'  >> $GITHUB_STEP_SUMMARY
+            ls -1 release_files/ | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY
           else
-            echo "No executables generated - check job logs" >> $GITHUB_STEP_SUMMARY
+            echo "- No artifacts generated" >> $GITHUB_STEP_SUMMARY
           fi
