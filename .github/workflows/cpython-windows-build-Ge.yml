@@ -91,32 +91,30 @@ jobs:
         run: |
           tar -xf "${{ steps.vars.outputs.filename }}"
 
-      - name: 编译 CPython
+      - name: 编译并生成完整安装包
         shell: cmd
         run: |
           cd Python-${{ steps.vars.outputs.version }}\PCbuild
           call get_externals.bat
-          :: 使用双引号将参数包裹，防止 bat 脚本吃掉等号
+          :: 1. 编译核心
           call build.bat -p ${{ matrix.arch }} -c Release "/p:PlatformToolset=v143"
-
-      - name: 整理输出并重命名 EXE
+          :: 2. 编译安装包生成工具 (这是官方打包的核心)
+          call build.bat -p ${{ matrix.arch }} -c Release "/p:PlatformToolset=v143" -t Build -t Rebuild -t build_installer
+          
+      - name: 提取安装包产物
         shell: bash
         run: |
           VERSION="${{ steps.vars.outputs.version }}"
-          BUILD_DIR="Python-${VERSION}/PCbuild/${{ steps.vars.outputs.build_dir }}"
-          OUT_NAME="${{ steps.vars.outputs.out_name }}"
+          # 编译完成后，安装包位于 en-us 文件夹下
+          BUILD_DIR="Python-${VERSION}/PCbuild/${{ steps.vars.outputs.build_dir }}/en-us"
           
           mkdir output_artifact
-          
-          cp "${BUILD_DIR}/python.exe" "output_artifact/${OUT_NAME}"
-          cp ${BUILD_DIR}/*.dll output_artifact/ || true
-          cp "${BUILD_DIR}/pythonw.exe" "output_artifact/" || true
-          
-          echo "正在打包标准库 Lib..."
-          cp -r "Python-${VERSION}/Lib" "output_artifact/Lib"
+          # 拷贝所有生成的 .msi 安装包和 .exe 安装引导程序
+          cp ${BUILD_DIR}/*.msi output_artifact/
+          cp ${BUILD_DIR}/*.exe output_artifact/ || true
 
       - name: 上传编译产物
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.vars.outputs.out_name }}-bundle
+          name: Python-${{ matrix.arch }}-Installer
           path: output_artifact/*
