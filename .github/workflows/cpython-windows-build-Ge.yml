@@ -91,34 +91,38 @@ jobs:
         run: |
           tar -xf "${{ steps.vars.outputs.filename }}"
 
-      - name: 编译并生成完整安装包
+      - name: 编译 CPython
         shell: cmd
         run: |
           cd Python-${{ steps.vars.outputs.version }}\PCbuild
           call get_externals.bat
-          
-          :: 直接通过 build.bat 传递参数，这是官方推荐的调用方式
-          :: -p: 指定平台 (amd64)
-          :: -c: 指定配置 (Release)
-          :: --no-git: 加上这个参数可以避免你之前看到的 git 错误警告
-          :: -t build_installer: 这是编译安装包的正确目标
-          
-          call build.bat -p ${{ matrix.arch }} -c Release "/p:PlatformToolset=v143" --no-git -t build_installer
-          
-      - name: 提取安装包产物
+          :: 使用双引号将参数包裹，防止 bat 脚本吃掉等号
+          call build.bat -p ${{ matrix.arch }} -c Release "/p:PlatformToolset=v143"
+
+      - name: 整理输出并重命名 EXE
         shell: bash
         run: |
           VERSION="${{ steps.vars.outputs.version }}"
-          # 编译完成后，安装包位于 en-us 文件夹下
-          BUILD_DIR="Python-${VERSION}/PCbuild/${{ steps.vars.outputs.build_dir }}/en-us"
+          BUILD_DIR="Python-${VERSION}/PCbuild/${{ steps.vars.outputs.build_dir }}"
+          OUT_NAME="${{ steps.vars.outputs.out_name }}"
           
           mkdir output_artifact
-          # 拷贝所有生成的 .msi 安装包和 .exe 安装引导程序
-          cp ${BUILD_DIR}/*.msi output_artifact/
-          cp ${BUILD_DIR}/*.exe output_artifact/ || true
+          
+          # 1. 拷贝核心二进制文件 (exe, dll)
+          cp "${BUILD_DIR}/python.exe" "output_artifact/${OUT_NAME}"
+          cp "${BUILD_DIR}/pythonw.exe" "output_artifact/" || true
+          cp ${BUILD_DIR}/*.dll output_artifact/ || true
+          
+          # 2. 拷贝 C 语言扩展模块 (.pyd)
+          echo "正在打包 C 扩展模块..."
+          cp ${BUILD_DIR}/*.pyd output_artifact/ || true
+          
+          # 3. 拷贝 Python 纯代码标准库
+          echo "正在打包标准库 Lib..."
+          cp -r "Python-${VERSION}/Lib" "output_artifact/Lib"
 
       - name: 上传编译产物
         uses: actions/upload-artifact@v7
         with:
-          name: Python-${{ matrix.arch }}-Installer
+          name: ${{ steps.vars.outputs.out_name }}-bundle
           path: output_artifact/*
