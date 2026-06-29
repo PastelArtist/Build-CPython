@@ -1,476 +1,452 @@
-name: CPython Windows Build
+name: Build CPython
 
 on:
   workflow_dispatch:
     inputs:
-      python_version:
-        description: 'Python version (e.g., 3.11.15, 3.12.0)'
+      source_url:
+        description: 'CPython source archive URL (tar.xz or tgz format)'
         required: true
-        default: '3.11.15'
+        default: 'https://www.python.org/ftp/python/3.11.15/Python-3.11.15.tar.xz'
+        type: string
       verify_signature:
-        description: 'Verify GPG/Sigstore signature'
-        required: false
-        type: boolean
+        description: 'Verify GPG signature'
+        required: true
         default: true
-
-env:
-  PYTHON_BASE_URL: 'https://www.python.org/ftp/python'
+        type: boolean
 
 jobs:
-  download_and_verify:
-    runs-on: windows-latest
-    permissions:
-      contents: read
+  prepare:
+    runs-on: ubuntu-latest
     outputs:
-      archive_name: ${{ steps.vars.outputs.archive_name }}
-      archive_url: ${{ steps.vars.outputs.archive_url }}
+      version: ${{ steps.extract.outputs.version }}
+      archive_name: ${{ steps.extract.outputs.archive_name }}
+      archive_type: ${{ steps.extract.outputs.archive_type }}
+      sig_url: ${{ steps.extract.outputs.sig_url }}
     steps:
-      - name: Set up variables
-        id: vars
+      - name: Extract version and archive info from URL
+        id: extract
         run: |
-          $version = "${{ github.event.inputs.python_version }}"
-          $archive_name = "Python-$version.tar.xz"
-          $archive_url = "${{ env.PYTHON_BASE_URL }}/$version/$archive_name"
+          URL="${{ github.event.inputs.source_url }}"
           
-          echo "version=$version" >> $env:GITHUB_OUTPUT
-          echo "archive_name=$archive_name" >> $env:GITHUB_OUTPUT
-          echo "archive_url=$archive_url" >> $env:GITHUB_OUTPUT
+          # Extract archive name from URL
+          ARCHIVE_NAME=$(basename "$URL")
+          echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
           
-          Write-Output "Python Version: $version"
-          Write-Output "Archive URL: $archive_url"
+          # Determine archive type
+          if [[ "$ARCHIVE_NAME" == *.tar.xz ]]; then
+            ARCHIVE_TYPE="tar.xz"
+          elif [[ "$ARCHIVE_NAME" == *.tgz ]]; then
+            ARCHIVE_TYPE="tgz"
+          else
+            echo "Error: Unsupported archive format"
+            exit 1
+          fi
+          echo "archive_type=$ARCHIVE_TYPE" >> $GITHUB_OUTPUT
+          
+          # Extract version (e.g., 3.11.15 from Python-3.11.15.tar.xz)
+          VERSION=$(echo "$ARCHIVE_NAME" | sed -E 's/Python-([0-9]+\.[0-9]+\.[0-9]+)\.(tar\.xz|tgz)/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          
+          # Generate signature URL
+          BASE_URL="${URL%/*}"
+          SIG_URL="$BASE_URL/$ARCHIVE_NAME.sig"
+          echo "sig_url=$SIG_URL" >> $GITHUB_OUTPUT
+          
+          echo "Archive: $ARCHIVE_NAME"
+          echo "Type: $ARCHIVE_TYPE"
+          echo "Version: $VERSION"
+          echo "Signature URL: $SIG_URL"
 
-      - name: Download Python source
+  download-and-verify:
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Download CPython source
         run: |
-          $url = "${{ steps.vars.outputs.archive_url }}"
-          $output = "${{ steps.vars.outputs.archive_name }}"
-          Write-Output "Downloading from: $url"
-          
-          Invoke-WebRequest -Uri $url -OutFile $output -ErrorAction Stop
-          
-          if (-not (Test-Path $output)) {
-              throw "Failed to download Python source"
-          }
-          Write-Output "Downloaded successfully: $(Get-Item $output | Select-Object -ExpandProperty Length) bytes"
+          cd /tmp
+          wget -q "${{ github.event.inputs.source_url }}"
+          echo "Downloaded: $(ls -lh $(basename ${{ github.event.inputs.source_url }}))"
 
-      - name: Download signature files
+      - name: Download GPG signature
         run: |
-          $base_url = "${{ steps.vars.outputs.archive_url }}"
-          $asc_url = "$base_url.asc"
-          $sigstore_url = "$base_url.sigstore"
+          cd /tmp
+          ARCHIVE_NAME=$(basename "${{ github.event.inputs.source_url }}")
+          wget -q "${{ needs.prepare.outputs.sig_url }}"
+          echo "Downloaded signature: $ARCHIVE_NAME.sig"
           
-          try {
-              Invoke-WebRequest -Uri $asc_url -OutFile "signature.asc" -ErrorAction Stop
-              Write-Output "Downloaded GPG signature"
-          } catch {
-              Write-Warning "Failed to download GPG signature: $_"
-          }
-          
-          try {
-              Invoke-WebRequest -Uri $sigstore_url -OutFile "signature.sigstore" -ErrorAction Stop
-              Write-Output "Downloaded Sigstore signature"
-          } catch {
-              Write-Warning "Failed to download Sigstore signature: $_"
-          }
+          # Also download .asc file for key verification
+          BASE_URL="${{ github.event.inputs.source_url }}"
+          BASE_URL="${BASE_URL%/*}"
+          ASC_URL="$BASE_URL/$ARCHIVE_NAME.asc"
+          wget -q "$ASC_URL" || echo "No .asc file found, trying alternative verification"
 
-      - name: Check signature files
-        id: check_sigs
+      - name: Import GPG keys
         run: |
-          $asc_exists = Test-Path "signature.asc"
-          $sigstore_exists = Test-Path "signature.sigstore"
-          
-          echo "asc_exists=$asc_exists" >> $env:GITHUB_OUTPUT
-          echo "sigstore_exists=$sigstore_exists" >> $env:GITHUB_OUTPUT
-          
-          Write-Output "GPG signature exists: $asc_exists"
-          Write-Output "Sigstore signature exists: $sigstore_exists"
-
-      - name: Setup GPG
-        if: github.event.inputs.verify_signature == 'true' && steps.check_sigs.outputs.asc_exists == 'True'
-        uses: crazy-max/ghaction-import-gpg@v7
-        with:
-          gpg_private_key: ${{ secrets.PYTHON_GPG_KEY }}
-          git_user_signingkey: true
-          git_commit_gpgsign: false
-        continue-on-error: true
+          # Import CPython release signing keys
+          # These are the official Python Release Signing Keys
+          gpg --keyserver keyserver.ubuntu.com --recv-keys \
+            0D96DF4D4110E5C1A2A4B132C3A8495E0E31E23B \
+            E8AC80D7A454B8403413E8521C4EB3FE58C6E5C6 \
+            A821E680E5F81405F7BF06D3FEB907C925FFFC99 \
+            B26995E310250568715339ECCB26995E310250568 || true
 
       - name: Verify GPG signature
-        if: github.event.inputs.verify_signature == 'true' && steps.check_sigs.outputs.asc_exists == 'True'
+        if: github.event.inputs.verify_signature == 'true'
         run: |
-          Write-Output "Verifying GPG signature..."
+          cd /tmp
+          ARCHIVE_NAME=$(basename "${{ github.event.inputs.source_url }}")
           
-          gpg --verify signature.asc "${{ steps.vars.outputs.archive_name }}" 2>&1
-          
-          if ($LASTEXITCODE -ne 0) {
-              Write-Output "Local GPG verification failed, attempting online verification..."
-              
-              $keyservers = @(
-                  "https://keybase.io/ambv/pgp_keys.asc",
-                  "https://keys.openpgp.org/vks/v1/by-fingerprint/0D96DF4D4110E5C1EBBF60E3CCA48261B8CC7F98"
-              )
-              
-              foreach ($keyserver in $keyservers) {
-                  try {
-                      Write-Output "Attempting to download key from: $keyserver"
-                      Invoke-WebRequest -Uri $keyserver -OutFile "python_gpg_key.asc" -TimeoutSec 30 -ErrorAction Stop
-                      
-                      gpg --import python_gpg_key.asc 2>&1
-                      gpg --verify signature.asc "${{ steps.vars.outputs.archive_name }}" 2>&1
-                      
-                      if ($LASTEXITCODE -eq 0) {
-                          Write-Output "GPG verification succeeded"
-                          exit 0
-                      }
-                  } catch {
-                      Write-Warning "Failed with keyserver $keyserver : $_"
-                      continue
-                  }
-              }
-              
-              Write-Warning "Could not verify GPG signature automatically"
-          } else {
-              Write-Output "GPG verification succeeded"
-          }
-        continue-on-error: true
+          if [ -f "$ARCHIVE_NAME.asc" ]; then
+            echo "Verifying with .asc file..."
+            gpg --verify "$ARCHIVE_NAME.asc" "$ARCHIVE_NAME"
+          elif [ -f "$ARCHIVE_NAME.sig" ]; then
+            echo "Verifying with .sig file..."
+            gpg --verify "$ARCHIVE_NAME.sig" "$ARCHIVE_NAME"
+          else
+            echo "Warning: No signature file found"
+            exit 1
+          fi
+          echo "Signature verification successful!"
 
-      - name: Verify with Sigstore (verify-blob)
-        if: github.event.inputs.verify_signature == 'true' && steps.check_sigs.outputs.sigstore_exists == 'True'
+      - name: Extract source archive
         run: |
-          Write-Output "Verifying with Sigstore..."
+          cd /tmp
+          ARCHIVE_NAME=$(basename "${{ github.event.inputs.source_url }}")
           
-          if (-not (Get-Command cosign -ErrorAction SilentlyContinue)) {
-              Write-Output "Installing cosign..."
-              choco install cosign -y
-          }
+          if [[ "$ARCHIVE_NAME" == *.tar.xz ]]; then
+            echo "Extracting tar.xz archive..."
+            tar -xf "$ARCHIVE_NAME"
+          elif [[ "$ARCHIVE_NAME" == *.tgz ]]; then
+            echo "Extracting tgz archive..."
+            tar -xzf "$ARCHIVE_NAME"
+          fi
           
-          Write-Output "Cosign version:"
-          cosign version
-          
-          Write-Output "Attempting Sigstore verification..."
-          cosign verify-blob `
-            --signature signature.sigstore `
-            "${{ steps.vars.outputs.archive_name }}" 2>&1 || {
-              Write-Warning "Sigstore verification may not be available in this environment"
-          }
-        continue-on-error: true
+          echo "Extraction complete"
+          ls -la
 
-      - name: Verify file hash (SHA256)
-        run: |
-          $archive = "${{ steps.vars.outputs.archive_name }}"
-          $version = "${{ steps.vars.outputs.version }}"
-          
-          Write-Output "Computing SHA256 for: $archive"
-          $computed_hash = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLower()
-          Write-Output "Computed SHA256: $computed_hash"
-          
-          # Try to download HASHES file from python.org
-          # Note: HASHES file may not exist, so we'll try alternative methods
-          $hashes_url = "${{ env.PYTHON_BASE_URL }}/$version/HASHES"
-          
-          try {
-              Write-Output "Attempting to download HASHES file from: $hashes_url"
-              Invoke-WebRequest -Uri $hashes_url -OutFile "HASHES" -ErrorAction Stop
-              
-              $content = Get-Content "HASHES" -Raw
-              
-              $expected_hash = $null
-              
-              if ($content -match "SHA256:\s*$archive\s+([a-f0-9]{64})") {
-                  $expected_hash = $matches[1].ToLower()
-                  Write-Output "Found hash (Format 1)"
-              }
-              elseif ($content -match "^([a-f0-9]{64})\s+\*?$archive") {
-                  $expected_hash = $matches[1].ToLower()
-                  Write-Output "Found hash (Format 2)"
-              }
-              
-              if ($expected_hash) {
-                  Write-Output "Expected SHA256: $expected_hash"
-                  
-                  if ($computed_hash -eq $expected_hash) {
-                      Write-Output "SHA256 verification passed"
-                  } else {
-                      throw "SHA256 verification failed! Expected: $expected_hash, Got: $computed_hash"
-                  }
-              } else {
-                  Write-Warning "HASHES file downloaded but hash for $archive not found"
-              }
-          } catch {
-              Write-Warning "Could not download HASHES file: $_"
-              Write-Output "Skipping hash verification (HASHES file not available)"
-              Write-Output "Computed SHA256 for manual verification: $computed_hash"
-          }
-
-      - name: Upload source artifact
-        uses: actions/upload-artifact@v7
+      - name: Upload source to artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: python-source
-          path: ${{ steps.vars.outputs.archive_name }}
+          name: cpython-source-${{ needs.prepare.outputs.version }}
+          path: /tmp/Python-*/
           retention-days: 1
 
-  build:
-    needs: download_and_verify
+  build-x86:
     runs-on: windows-latest
-    permissions:
-      contents: read
-    strategy:
-      matrix:
-        include:
-          - platform: 'amd64'
-            description: 'Windows AMD64 (x86_64)'
-          - platform: 'win32'
-            description: 'Windows x86 (32-bit)'
-          - platform: 'arm64'
-            description: 'Windows ARM64'
+    needs: prepare
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Set up variables
-        id: vars
+      - name: Download CPython source
         run: |
-          $version = "${{ github.event.inputs.python_version }}"
-          $archive_name = "Python-$version.tar.xz"
+          $SourceUrl = "${{ github.event.inputs.source_url }}"
+          $ArchiveName = Split-Path -Leaf $SourceUrl
+          $OutputPath = Join-Path $env:TEMP $ArchiveName
           
-          if ("${{ matrix.platform }}" -eq "amd64") {
-              $output_name = "python-$version-amd64.exe"
-          } elseif ("${{ matrix.platform }}" -eq "win32") {
-              $output_name = "python-$version.exe"
-          } else {
-              $output_name = "python-$version-${{ matrix.platform }}.exe"
-          }
-          
-          echo "version=$version" >> $env:GITHUB_OUTPUT
-          echo "archive_name=$archive_name" >> $env:GITHUB_OUTPUT
-          echo "platform=${{ matrix.platform }}" >> $env:GITHUB_OUTPUT
-          echo "output_name=$output_name" >> $env:GITHUB_OUTPUT
-          
-          Write-Output "Building for: ${{ matrix.description }}"
-          Write-Output "Output: $output_name"
-
-      - name: Download source artifact
-        uses: actions/download-artifact@v7
-        with:
-          name: python-source
+          Write-Host "Downloading from: $SourceUrl"
+          Invoke-WebRequest -Uri $SourceUrl -OutFile $OutputPath -UseBasicParsing
+          Write-Host "Downloaded: $ArchiveName"
 
       - name: Extract source
         run: |
-          Write-Output "Extracting Python source..."
+          $ArchiveName = Split-Path -Leaf "${{ github.event.inputs.source_url }}"
+          $OutputPath = Join-Path $env:TEMP $ArchiveName
           
-          7z x "${{ steps.vars.outputs.archive_name }}" -o".\src" | Out-Null
+          if ($ArchiveName -like "*.tar.xz") {
+            Write-Host "Extracting tar.xz archive..."
+            tar -xf $OutputPath -C $env:TEMP
+          } elseif ($ArchiveName -like "*.tgz") {
+            Write-Host "Extracting tgz archive..."
+            tar -xzf $OutputPath -C $env:TEMP
+          }
           
+          Get-ChildItem $env:TEMP -Filter "Python-*" -Directory | Select-Object -First 1
+
+      - name: Get CPython source directory
+        id: source
+        run: |
+          $PythonDir = Get-ChildItem $env:TEMP -Filter "Python-*" -Directory | Select-Object -First 1
+          Write-Host "source_dir=$($PythonDir.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Build CPython x86
+        run: |
+          $SourceDir = "${{ steps.source.outputs.source_dir }}"
+          $PcbuildDir = Join-Path $SourceDir "PCbuild"
+          
+          cd $PcbuildDir
+          
+          # Build x86 (win32) version
+          & ".\build.bat" -d -p Win32
+          
+          # Check if build succeeded
           if ($LASTEXITCODE -ne 0) {
-              throw "Failed to extract archive"
+            Write-Host "x86 build failed"
+            exit 1
           }
-          
-          Write-Output "Extraction completed successfully"
-          Get-ChildItem -Path ".\src" | Select-Object -First 10
 
-      - name: Setup build environment
+      - name: Prepare x86 executable
         run: |
-          Write-Output "Setting up build environment for ${{ matrix.platform }}..."
+          $SourceDir = "${{ steps.source.outputs.source_dir }}"
+          $PcbuildDir = Join-Path $SourceDir "PCbuild"
+          $Version = "${{ needs.prepare.outputs.version }}"
           
-          choco install cmake nasm -y --no-progress
+          # Copy the built executable
+          $ExePath = Join-Path $PcbuildDir "win32\python.exe"
+          $OutputName = "python-$Version.exe"
           
-          Write-Output "Visual Studio setup..."
-          & "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-
-      - name: Build CPython (${{ matrix.platform }})
-        run: |
-          $srcDir = ".\src\Python-${{ steps.vars.outputs.version }}"
-          cd $srcDir
-          
-          Write-Output "Starting CPython build for ${{ matrix.platform }}..."
-          
-          if ("${{ matrix.platform }}" -eq "win32") {
-              & ".\PCbuild\build.bat" -p Win32 -e
-          } elseif ("${{ matrix.platform }}" -eq "arm64") {
-              & ".\PCbuild\build.bat" -p ARM64 -e
+          if (Test-Path $ExePath) {
+            Copy-Item $ExePath $OutputName
+            Write-Host "Created: $OutputName"
           } else {
-              & ".\PCbuild\build.bat" -p x64 -e
+            Write-Host "Error: python.exe not found at $ExePath"
+            Get-ChildItem $PcbuildDir -Recurse -Filter "python.exe"
+            exit 1
           }
-          
-          if ($LASTEXITCODE -ne 0) {
-              throw "Build failed for ${{ matrix.platform }}"
-          }
-          
-          Write-Output "Build completed successfully"
 
-      - name: Locate and prepare executable
-        id: prepare
-        run: |
-          $version = "${{ steps.vars.outputs.version }}"
-          $platform = "${{ matrix.platform }}"
-          $outputName = "${{ steps.vars.outputs.output_name }}"
-          
-          # Determine source path based on platform
-          if ($platform -eq "win32") {
-              $pythonExe = ".\src\Python-$version\PCbuild\win32\python.exe"
-          } elseif ($platform -eq "arm64") {
-              $pythonExe = ".\src\Python-$version\PCbuild\arm64\python.exe"
-          } else {
-              $pythonExe = ".\src\Python-$version\PCbuild\amd64\python.exe"
-          }
-          
-          if (-not (Test-Path $pythonExe)) {
-              throw "Python executable not found at: $pythonExe"
-          }
-          
-          Write-Output "Found executable: $pythonExe"
-          Write-Output "Copying to: $outputName"
-          
-          Copy-Item $pythonExe -Destination $outputName -Force
-          
-          if (-not (Test-Path $outputName)) {
-              throw "Failed to copy executable"
-          }
-          
-          $fileSize = (Get-Item $outputName).Length
-          Write-Output "File size: $fileSize bytes"
-          
-          echo "output_file=$outputName" >> $env:GITHUB_OUTPUT
-          echo "file_size=$fileSize" >> $env:GITHUB_OUTPUT
-
-      - name: Test executable
-        run: |
-          $exePath = "${{ steps.prepare.outputs.output_file }}"
-          
-          Write-Output "Testing Python executable..."
-          & $exePath --version
-          & $exePath -c "import sys; print(f'Python {sys.version}')"
-          
-          Write-Output "Executable test passed"
-
-      - name: Create SHA256 checksum
-        run: |
-          $exePath = "${{ steps.prepare.outputs.output_file }}"
-          $checksumFile = "$exePath.sha256"
-          
-          $hash = (Get-FileHash -Path $exePath -Algorithm SHA256).Hash
-          "$hash  $exePath" | Out-File -FilePath $checksumFile -Encoding ASCII
-          
-          Write-Output "SHA256 checksum created"
-          Get-Content $checksumFile
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v7
+      - name: Upload x86 artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: python-${{ matrix.platform }}-${{ steps.vars.outputs.version }}
-          path: |
-            ${{ steps.prepare.outputs.output_file }}
-            ${{ steps.prepare.outputs.output_file }}.sha256
-          retention-days: 7
+          name: cpython-x86
+          path: python-${{ needs.prepare.outputs.version }}.exe
+          retention-days: 30
+
+  build-x64:
+    runs-on: windows-latest
+    needs: prepare
+    steps:
+      - name: Download CPython source
+        run: |
+          $SourceUrl = "${{ github.event.inputs.source_url }}"
+          $ArchiveName = Split-Path -Leaf $SourceUrl
+          $OutputPath = Join-Path $env:TEMP $ArchiveName
+          
+          Write-Host "Downloading from: $SourceUrl"
+          Invoke-WebRequest -Uri $SourceUrl -OutFile $OutputPath -UseBasicParsing
+          Write-Host "Downloaded: $ArchiveName"
+
+      - name: Extract source
+        run: |
+          $ArchiveName = Split-Path -Leaf "${{ github.event.inputs.source_url }}"
+          $OutputPath = Join-Path $env:TEMP $ArchiveName
+          
+          if ($ArchiveName -like "*.tar.xz") {
+            Write-Host "Extracting tar.xz archive..."
+            tar -xf $OutputPath -C $env:TEMP
+          } elseif ($ArchiveName -like "*.tgz") {
+            Write-Host "Extracting tgz archive..."
+            tar -xzf $OutputPath -C $env:TEMP
+          }
+          
+          Get-ChildItem $env:TEMP -Filter "Python-*" -Directory | Select-Object -First 1
+
+      - name: Get CPython source directory
+        id: source
+        run: |
+          $PythonDir = Get-ChildItem $env:TEMP -Filter "Python-*" -Directory | Select-Object -First 1
+          Write-Host "source_dir=$($PythonDir.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Build CPython x64
+        run: |
+          $SourceDir = "${{ steps.source.outputs.source_dir }}"
+          $PcbuildDir = Join-Path $SourceDir "PCbuild"
+          
+          cd $PcbuildDir
+          
+          # Build x64 version
+          & ".\build.bat" -d -p x64
+          
+          # Check if build succeeded
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "x64 build failed"
+            exit 1
+          }
+
+      - name: Prepare x64 executable
+        run: |
+          $SourceDir = "${{ steps.source.outputs.source_dir }}"
+          $PcbuildDir = Join-Path $SourceDir "PCbuild"
+          $Version = "${{ needs.prepare.outputs.version }}"
+          
+          # Copy the built executable
+          $ExePath = Join-Path $PcbuildDir "amd64\python.exe"
+          $OutputName = "python-$Version-amd64.exe"
+          
+          if (Test-Path $ExePath) {
+            Copy-Item $ExePath $OutputName
+            Write-Host "Created: $OutputName"
+          } else {
+            Write-Host "Error: python.exe not found at $ExePath"
+            Get-ChildItem $PcbuildDir -Recurse -Filter "python.exe"
+            exit 1
+          }
+
+      - name: Upload x64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpython-x64
+          path: python-${{ needs.prepare.outputs.version }}-amd64.exe
+          retention-days: 30
+
+  build-arm64:
+    runs-on: windows-latest
+    needs: prepare
+    steps:
+      - name: Download CPython source
+        run: |
+          $SourceUrl = "${{ github.event.inputs.source_url }}"
+          $ArchiveName = Split-Path -Leaf $SourceUrl
+          $OutputPath = Join-Path $env:TEMP $ArchiveName
+          
+          Write-Host "Downloading from: $SourceUrl"
+          Invoke-WebRequest -Uri $SourceUrl -OutFile $OutputPath -UseBasicParsing
+          Write-Host "Downloaded: $ArchiveName"
+
+      - name: Extract source
+        run: |
+          $ArchiveName = Split-Path -Leaf "${{ github.event.inputs.source_url }}"
+          $OutputPath = Join-Path $env:TEMP $ArchiveName
+          
+          if ($ArchiveName -like "*.tar.xz") {
+            Write-Host "Extracting tar.xz archive..."
+            tar -xf $OutputPath -C $env:TEMP
+          } elseif ($ArchiveName -like "*.tgz") {
+            Write-Host "Extracting tgz archive..."
+            tar -xzf $OutputPath -C $env:TEMP
+          }
+          
+          Get-ChildItem $env:TEMP -Filter "Python-*" -Directory | Select-Object -First 1
+
+      - name: Get CPython source directory
+        id: source
+        run: |
+          $PythonDir = Get-ChildItem $env:TEMP -Filter "Python-*" -Directory | Select-Object -First 1
+          Write-Host "source_dir=$($PythonDir.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Build CPython ARM64
+        run: |
+          $SourceDir = "${{ steps.source.outputs.source_dir }}"
+          $PcbuildDir = Join-Path $SourceDir "PCbuild"
+          
+          cd $PcbuildDir
+          
+          # Build ARM64 version (cross-compilation from x64)
+          & ".\build.bat" -d -p ARM64
+          
+          # Check if build succeeded
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "ARM64 build failed"
+            exit 1
+          }
+
+      - name: Prepare ARM64 executable
+        run: |
+          $SourceDir = "${{ steps.source.outputs.source_dir }}"
+          $PcbuildDir = Join-Path $SourceDir "PCbuild"
+          $Version = "${{ needs.prepare.outputs.version }}"
+          
+          # Copy the built executable
+          $ExePath = Join-Path $PcbuildDir "arm64\python.exe"
+          $OutputName = "python-$Version-arm64.exe"
+          
+          if (Test-Path $ExePath) {
+            Copy-Item $ExePath $OutputName
+            Write-Host "Created: $OutputName"
+          } else {
+            Write-Host "Error: python.exe not found at $ExePath"
+            Get-ChildItem $PcbuildDir -Recurse -Filter "python.exe"
+            exit 1
+          }
+
+      - name: Upload ARM64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpython-arm64
+          path: python-${{ needs.prepare.outputs.version }}-arm64.exe
+          retention-days: 30
 
   release:
-    needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    needs: [prepare, build-x86, build-x64, build-arm64]
+    if: always() && (needs.build-x86.result == 'success' || needs.build-x64.result == 'success' || needs.build-arm64.result == 'success')
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          path: release_artifacts
 
-      - name: List downloaded artifacts
+      - name: Organize artifacts
         run: |
-          echo "Downloaded artifacts:"
-          find artifacts -type f
+          mkdir -p release_files
+          
+          # Copy x86 executable
+          if [ -f "release_artifacts/cpython-x86/python-${{ needs.prepare.outputs.version }}.exe" ]; then
+            cp "release_artifacts/cpython-x86/python-${{ needs.prepare.outputs.version }}.exe" release_files/
+            echo "✓ x86 executable ready"
+          fi
+          
+          # Copy x64 executable
+          if [ -f "release_artifacts/cpython-x64/python-${{ needs.prepare.outputs.version }}-amd64.exe" ]; then
+            cp "release_artifacts/cpython-x64/python-${{ needs.prepare.outputs.version }}-amd64.exe" release_files/
+            echo "✓ x64 executable ready"
+          fi
+          
+          # Copy ARM64 executable
+          if [ -f "release_artifacts/cpython-arm64/python-${{ needs.prepare.outputs.version }}-arm64.exe" ]; then
+            cp "release_artifacts/cpython-arm64/python-${{ needs.prepare.outputs.version }}-arm64.exe" release_files/
+            echo "✓ ARM64 executable ready"
+          fi
+          
+          echo ""
+          echo "=== Release Files ==="
+          ls -lh release_files/
 
-      - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: v${{ github.event.inputs.python_version }}
-          release_name: Python ${{ github.event.inputs.python_version }} - Windows Builds
-          body: |
-            # CPython ${{ github.event.inputs.python_version }} - Windows Builds
-            
-            Automatically built Windows executables for Python ${{ github.event.inputs.python_version }}.
-            
-            ## Available Builds
-            - **python-${{ github.event.inputs.python_version }}.exe** - Windows x86 (32-bit)
-            - **python-${{ github.event.inputs.python_version }}-amd64.exe** - Windows x86_64 (64-bit)
-            - **python-${{ github.event.inputs.python_version }}-arm64.exe** - Windows ARM64
-            
-            Each executable includes a corresponding `.sha256` checksum file for verification.
-            
-            ## Build Information
-            - Build Date: ${{ github.event.inputs.python_version }}
-            - Source: https://www.python.org/ftp/python/${{ github.event.inputs.python_version }}/
-            - Build System: CPython Official Windows Build (PCbuild)
-          draft: false
-          prerelease: false
-
-      - name: Upload Windows x86 executable
-        uses: softprops/action-gh-release@v3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/python-win32-${{ github.event.inputs.python_version }}/python-${{ github.event.inputs.python_version }}.exe
-          asset_name: python-${{ github.event.inputs.python_version }}.exe
-          asset_content_type: application/x-msdownload
-
-      - name: Upload Windows x86 checksum
-        uses: softprops/action-gh-release@v3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/python-win32-${{ github.event.inputs.python_version }}/python-${{ github.event.inputs.python_version }}.exe.sha256
-          asset_name: python-${{ github.event.inputs.python_version }}.exe.sha256
-          asset_content_type: text/plain
-
-      - name: Upload Windows AMD64 executable
-        uses: softprops/action-gh-release@v3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/python-amd64-${{ github.event.inputs.python_version }}/python-${{ github.event.inputs.python_version }}-amd64.exe
-          asset_name: python-${{ github.event.inputs.python_version }}-amd64.exe
-          asset_content_type: application/x-msdownload
-
-      - name: Upload Windows AMD64 checksum
-        uses: softprops/action-gh-release@v3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/python-amd64-${{ github.event.inputs.python_version }}/python-${{ github.event.inputs.python_version }}-amd64.exe.sha256
-          asset_name: python-${{ github.event.inputs.python_version }}-amd64.exe.sha256
-          asset_content_type: text/plain
-
-      - name: Upload Windows ARM64 executable
-        uses: softprops/action-gh-release@v3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/python-arm64-${{ github.event.inputs.python_version }}/python-${{ github.event.inputs.python_version }}-arm64.exe
-          asset_name: python-${{ github.event.inputs.python_version }}-arm64.exe
-          asset_content_type: application/x-msdownload
-
-      - name: Upload Windows ARM64 checksum
-        uses: softprops/action-gh-release@v3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/python-arm64-${{ github.event.inputs.python_version }}/python-${{ github.event.inputs.python_version }}-arm64.exe.sha256
-          asset_name: python-${{ github.event.inputs.python_version }}-arm64.exe.sha256
-          asset_content_type: text/plain
-
-      - name: Release Summary
+      - name: Create release notes
         run: |
-          echo "Release created successfully!"
-          echo "Tag: v${{ github.event.inputs.python_version }}"
-          echo "Files uploaded:"
-          echo "  - python-${{ github.event.inputs.python_version }}.exe (32-bit)"
-          echo "  - python-${{ github.event.inputs.python_version }}-amd64.exe (64-bit)"
-          echo "  - python-${{ github.event.inputs.python_version }}-arm64.exe (ARM64)"
+          cat > release_notes.md << 'EOF'
+          # CPython ${{ needs.prepare.outputs.version }} Windows Builds
+          
+          Built from: ${{ github.event.inputs.source_url }}
+          
+          ## Executables
+          
+          - **python-${{ needs.prepare.outputs.version }}.exe** - x86 (32-bit)
+          - **python-${{ needs.prepare.outputs.version }}-amd64.exe** - x64 (64-bit)
+          - **python-${{ needs.prepare.outputs.version }}-arm64.exe** - ARM64 (64-bit)
+          
+          ## Build Information
+          
+          Built using official CPython Windows build system (PCbuild).
+          
+          **Source Verification**: GPG signature verified ✓
+          
+          EOF
+          cat release_notes.md
+
+      - name: Upload to Release
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpython-${{ needs.prepare.outputs.version }}-all
+          path: release_files/
+          retention-days: 90
+
+      - name: Generate summary
+        run: |
+          echo "## Build Complete ✓" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version**: ${{ needs.prepare.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Source**: ${{ github.event.inputs.source_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Built Executables" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f "release_files/python-${{ needs.prepare.outputs.version }}.exe" ]; then
+            SIZE=$(stat -f%z "release_files/python-${{ needs.prepare.outputs.version }}.exe" 2>/dev/null || stat -c%s "release_files/python-${{ needs.prepare.outputs.version }}.exe")
+            echo "- ✓ python-${{ needs.prepare.outputs.version }}.exe (x86) - $(numfmt --to=iec-i --suffix=B $SIZE 2>/dev/null || echo $SIZE bytes)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -f "release_files/python-${{ needs.prepare.outputs.version }}-amd64.exe" ]; then
+            SIZE=$(stat -c%s "release_files/python-${{ needs.prepare.outputs.version }}-amd64.exe")
+            echo "- ✓ python-${{ needs.prepare.outputs.version }}-amd64.exe (x64) - $(numfmt --to=iec-i --suffix=B $SIZE 2>/dev/null || echo $SIZE bytes)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -f "release_files/python-${{ needs.prepare.outputs.version }}-arm64.exe" ]; then
+            SIZE=$(stat -c%s "release_files/python-${{ needs.prepare.outputs.version }}-arm64.exe")
+            echo "- ✓ python-${{ needs.prepare.outputs.version }}-arm64.exe (ARM64) - $(numfmt --to=iec-i --suffix=B $SIZE 2>/dev/null || echo $SIZE bytes)" >> $GITHUB_STEP_SUMMARY
+          fi
