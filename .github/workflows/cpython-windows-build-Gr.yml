@@ -27,12 +27,12 @@ jobs:
             build_platform: ARM64
             suffix: '-arm64'
       fail-fast: false
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Install 7-Zip
+      - name: Install tools
         shell: pwsh
         run: choco install 7zip -y --no-progress
 
@@ -45,9 +45,7 @@ jobs:
           Invoke-WebRequest -Uri $env:SOURCE_URL -OutFile $fileName
           
           $base = $fileName -replace '\.tar\.(xz|gz|tgz)$',''
-          @('.sigstore','.sig','.asc') | ForEach-Object { 
-            try { Invoke-WebRequest -Uri "$env:SOURCE_URL$_" -OutFile "$base$_" -ErrorAction SilentlyContinue } catch {} 
-          }
+          @('.sigstore','.sig','.asc') | ForEach-Object { try { Invoke-WebRequest "$env:SOURCE_URL$_" "$base$_" -ErrorAction SilentlyContinue } catch {} }
           
           if ($fileName -like "*.xz") {
             7z x $fileName -so | 7z x -si -ttar -oPython-src
@@ -55,7 +53,7 @@ jobs:
             7z x $fileName -so | 7z x -si -ttar -oPython-src
           }
           
-          $srcDir = Get-ChildItem -Path "Python-src" -Directory | Select-Object -First 1
+          $srcDir = Get-ChildItem Python-src -Directory | Select-Object -First 1
           echo "PYTHON_SRC=$($srcDir.FullName)" >> $env:GITHUB_ENV
 
       - name: Verify signature
@@ -64,11 +62,7 @@ jobs:
           if (Test-Path "$env:PYTHON_SRC\..\*.sigstore") {
             pip install --quiet sigstore
             $tar = Get-ChildItem "$env:PYTHON_SRC\.." -Filter "Python*.tar*" | Select-Object -First 1
-            python -m sigstore verify identity `
-              --bundle "$($tar.Name).sigstore" `
-              --cert-identity "pablogsal@python.org" `
-              --cert-oidc-issuer "https://accounts.google.com" `
-              "$($tar.Name)"
+            python -m sigstore verify identity --bundle "$($tar.Name).sigstore" --cert-identity "pablogsal@python.org" --cert-oidc-issuer "https://accounts.google.com" "$($tar.Name)"
           }
 
       - name: Setup MSVC
@@ -76,13 +70,18 @@ jobs:
         with:
           arch: ${{ matrix.arch_name }}
 
-      - name: Retarget Toolset
+      - name: Retarget Solution to VS 2022
         shell: pwsh
         working-directory: ${{ env.PYTHON_SRC }}
         run: |
+          # Replace toolset in all vcxproj
           Get-ChildItem -Recurse -Filter "*.vcxproj" | ForEach-Object {
-            (Get-Content $_.FullName -Raw) -replace 'v140', 'v143' | Set-Content $_.FullName
+            $content = Get-Content $_.FullName -Raw
+            $content = $content -replace 'PlatformToolset>v140<', 'PlatformToolset>v143<'
+            $content = $content -replace 'v140', 'v143'
+            $content | Set-Content $_.FullName
           }
+          Write-Host "Retarget completed"
 
       - name: Build Python
         shell: cmd
@@ -98,13 +97,14 @@ jobs:
           cd Tools\msi
           build.bat -${{ matrix.arch_name }} --doc
 
-      - name: Collect installer
+      - name: Collect
         shell: pwsh
         run: |
-          $ver = (Select-String -Path "${env:PYTHON_SRC}\Include\patchlevel.h" -Pattern 'PY_VERSION\s+"([^"]+)"').Matches.Groups[1].Value
+          $verMatch = Select-String "${env:PYTHON_SRC}\Include\patchlevel.h" -Pattern 'PY_VERSION\s+"([^"]+)"'
+          $version = $verMatch.Matches.Groups[1].Value
           $installer = Get-ChildItem "${env:PYTHON_SRC}\Tools\msi\en-us" -Filter "python-*.exe" -Recurse | Select-Object -First 1
           if ($installer) {
-            Copy-Item $installer.FullName "python-$ver${{ matrix.suffix }}.exe" -Force
+            Copy-Item $installer.FullName "python-$version${{ matrix.suffix }}.exe" -Force
           }
 
       - name: Upload
