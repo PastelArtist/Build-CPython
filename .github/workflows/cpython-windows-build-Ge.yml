@@ -96,10 +96,14 @@ jobs:
         run: |
           cd Python-${{ steps.vars.outputs.version }}\PCbuild
           call get_externals.bat
-          :: 1. 编译核心
-          call build.bat -p ${{ matrix.arch }} -c Release "/p:PlatformToolset=v143"
-          :: 2. 编译安装包生成工具 (这是官方打包的核心)
-          call build.bat -p ${{ matrix.arch }} -c Release "/p:PlatformToolset=v143" -t Build -t Rebuild -t build_installer
+          
+          :: 直接通过 build.bat 传递参数，这是官方推荐的调用方式
+          :: -p: 指定平台 (amd64)
+          :: -c: 指定配置 (Release)
+          :: --no-git: 加上这个参数可以避免你之前看到的 git 错误警告
+          :: -t build_installer: 这是编译安装包的正确目标
+          
+          call build.bat -p ${{ matrix.arch }} -c Release "/p:PlatformToolset=v143" --no-git -t build_installer
           
       - name: 提取安装包产物
         shell: bash
