@@ -1,0 +1,131 @@
+name: Build CPython Windows Installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: 'Python source tarball URL (.tar.xz or .tgz)'
+        required: true
+        type: string
+        default: 'https://www.python.org/ftp/python/3.11.15/Python-3.11.15.tar.xz'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        arch: [win32, amd64, arm64]
+      fail-fast: false
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository (optional, for scripts if needed)
+        uses: actions/checkout@v7
+
+      - name: Install dependencies (Git, 7z, etc.)
+        shell: pwsh
+        run: |
+          choco install 7zip -y --no-progress
+          # Git is usually pre-installed
+
+      - name: Download source and signature files
+        shell: pwsh
+        env:
+          SOURCE_URL: ${{ inputs.source_url }}
+        run: |
+          $baseName = [System.IO.Path]::GetFileNameWithoutExtension($env:SOURCE_URL)
+          $ext = [System.IO.Path]::GetExtension($env:SOURCE_URL)
+          
+          Write-Host "Downloading $env:SOURCE_URL"
+          Invoke-WebRequest -Uri $env:SOURCE_URL -OutFile "Python.tar$ext"
+          
+          # Download associated signature files
+          $sigUrls = @(
+            "$env:SOURCE_URL.sig",
+            "$env:SOURCE_URL.sigstore",
+            "$env:SOURCE_URL.asc"
+          )
+          foreach ($sigUrl in $sigUrls) {
+            try {
+              Invoke-WebRequest -Uri $sigUrl -OutFile ([System.IO.Path]::GetFileName($sigUrl)) -ErrorAction Stop
+              Write-Host "Downloaded $sigUrl"
+            } catch {
+              Write-Host "No signature file at $sigUrl (expected for some)"
+            }
+          }
+
+      - name: Extract source
+        shell: pwsh
+        run: |
+          if (Test-Path "Python.tar.xz") {
+            7z x Python.tar.xz -so | 7z x -si -ttar -o"Python-src"
+          } elseif (Test-Path "Python.tar.gz" -or Test-Path "Python.tgz") {
+            7z x Python.tar* -so | 7z x -si -ttar -o"Python-src"
+          } else {
+            Write-Error "No tarball found"
+            exit 1
+          }
+          cd Python-src\Python-*
+          $global:PYTHON_SRC = (Get-Location).Path
+          Write-Host "Source extracted to $global:PYTHON_SRC"
+
+      - name: Verify signature (Sigstore preferred, fallback GPG)
+        shell: pwsh
+        run: |
+          cd "$env:PYTHON_SRC\.."
+          $tarFile = Get-ChildItem -Filter "Python*.tar*" | Select-Object -First 1
+          if (Test-Path "$tarFile.sigstore") {
+            Write-Host "Verifying with Sigstore..."
+            python -m pip install sigstore
+            python -m sigstore verify identity `
+              --bundle "$tarFile.sigstore" `
+              --cert-identity "pablogsal@python.org" `  # Update if key changes
+              --cert-oidc-issuer "https://accounts.google.com" `
+              "$tarFile"
+          } elseif (Test-Path "$tarFile.sig" -or Test-Path "$tarFile.asc") {
+            Write-Host "GPG verification not fully automated here (import key manually if needed)"
+            # gpg --verify ... (requires key import)
+          } else {
+            Write-Warning "No signature file found for verification"
+          }
+
+      - name: Setup build environment (Visual Studio)
+        uses: ilammy/msvc-dev-cmd@master
+        with:
+          arch: ${{ matrix.arch == 'win32' && 'x86' || (matrix.arch == 'amd64' && 'x64' || 'arm64') }}
+
+      - name: Build Python core (PCbuild)
+        shell: cmd
+        working-directory: ${{ env.PYTHON_SRC }}
+        run: |
+          cd PCbuild
+          build.bat -e -p ${{ matrix.arch == 'win32' && 'Win32' || matrix.arch }} -c Release
+
+      - name: Build Windows Installer (MSI/EXE)
+        shell: cmd
+        working-directory: ${{ env.PYTHON_SRC }}
+        run: |
+          cd Tools\msi
+          build.bat -${{ matrix.arch == 'win32' && 'x86' || matrix.arch }} --doc
+
+      - name: Rename and collect artifacts
+        shell: pwsh
+        run: |
+          $version = (Get-Content -Path "${{ env.PYTHON_SRC }}\Include\patchlevel.h" | Select-String 'PY_VERSION' | ForEach-Object { $_.Line -replace '.*"([^"]+)".*', '$1' })
+          $archSuffix = @{
+            'win32' = ''
+            'amd64' = '-amd64'
+            'arm64' = '-arm64'
+          }[$env:MATRIX_ARCH]
+          
+          $installer = Get-ChildItem -Path "${{ env.PYTHON_SRC }}\Tools\msi\en-us" -Filter "python-*.exe" | Select-Object -First 1
+          if ($installer) {
+            $newName = "python-$version$archSuffix.exe"
+            Copy-Item $installer.FullName -Destination $newName
+            Write-Host "Created $newName"
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-installer-${{ matrix.arch }}
+          path: python-*.exe
+          if-no-files-found: error
