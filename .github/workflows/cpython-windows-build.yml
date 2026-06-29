@@ -54,24 +54,28 @@ jobs:
           wget -q "${{ github.event.inputs.source_url }}"
           echo "Downloaded: $(ls -lh $(basename ${{ github.event.inputs.source_url }}))"
 
-      - name: Download GPG signature
+      - name: Download GPG signature and certificate
         run: |
           cd /tmp
           ARCHIVE_NAME=$(basename "${{ github.event.inputs.source_url }}")
           BASE_URL="${{ github.event.inputs.source_url }}"
           BASE_URL="${BASE_URL%/*}"
           
+          # Download .asc file
           wget -q "$BASE_URL/$ARCHIVE_NAME.asc" || echo "No .asc file found"
+          
           ls -lh $ARCHIVE_NAME* 2>/dev/null
 
       - name: Import GPG keys
         run: |
           echo "Importing GPG keys..."
           
+          # Try multiple keyservers for better reliability
           gpg --keyserver keys.openpgp.org --recv-keys CFDCA245B1043CF2A5F97865FFE87404168BD847 2>&1 || \
           gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys CFDCA245B1043CF2A5F97865FFE87404168BD847 2>&1 || \
           echo "Primary key not found, trying fallback keys..."
           
+          # Fallback keys
           gpg --keyserver keys.openpgp.org --recv-keys \
             0D96DF4D4110E5C1A2A4B132C3A8495E0E31E23B \
             E8AC80D7A454B8403413E8521C4EB3FE58C6E5C6 \
@@ -150,7 +154,7 @@ jobs:
             tar -xzf $OutputPath -C $env:TEMP
           }
 
-      - name: Locate source directory
+      - name: Locate source
         id: build
         run: |
           $PythonDirs = @(Get-ChildItem $env:TEMP -Directory -Filter "Python-*" -ErrorAction SilentlyContinue)
@@ -160,7 +164,6 @@ jobs:
           }
           
           $SourceDir = $PythonDirs[0].FullName
-          Write-Host "Found source: $SourceDir"
           echo "source_dir=$SourceDir" >> $env:GITHUB_OUTPUT
 
       - name: Build CPython x86 (Win32)
@@ -176,7 +179,6 @@ jobs:
             Write-Host "Build failed with exit code: $LASTEXITCODE"
             exit 1 
           }
-          Write-Host "Build successful"
 
       - name: Locate x86 executable
         id: exe
@@ -224,12 +226,8 @@ jobs:
         run: |
           $ArchivePath = Join-Path $env:TEMP "${{ needs.prepare.outputs.archive_name }}"
           
-          Write-Host "Computing SHA256..."
           $CurrentHash = (Get-FileHash -Path $ArchivePath -Algorithm SHA256).Hash.ToLower()
           $ExpectedHash = "${{ needs.download-and-verify.outputs.sha256 }}".ToLower()
-          
-          Write-Host "Expected: $ExpectedHash"
-          Write-Host "Current:  $CurrentHash"
           
           if ($CurrentHash -eq $ExpectedHash) {
             Write-Host "Archive integrity verified!"
@@ -249,7 +247,7 @@ jobs:
             tar -xzf $OutputPath -C $env:TEMP
           }
 
-      - name: Locate source directory
+      - name: Locate source
         id: build
         run: |
           $PythonDirs = @(Get-ChildItem $env:TEMP -Directory -Filter "Python-*" -ErrorAction SilentlyContinue)
@@ -266,7 +264,6 @@ jobs:
           & cmd /c "build.bat -d -p x64"
           
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          Write-Host "Build successful"
 
       - name: Locate x64 executable
         id: exe
@@ -305,12 +302,8 @@ jobs:
         run: |
           $ArchivePath = Join-Path $env:TEMP "${{ needs.prepare.outputs.archive_name }}"
           
-          Write-Host "Computing SHA256..."
           $CurrentHash = (Get-FileHash -Path $ArchivePath -Algorithm SHA256).Hash.ToLower()
           $ExpectedHash = "${{ needs.download-and-verify.outputs.sha256 }}".ToLower()
-          
-          Write-Host "Expected: $ExpectedHash"
-          Write-Host "Current:  $CurrentHash"
           
           if ($CurrentHash -eq $ExpectedHash) {
             Write-Host "Archive integrity verified!"
@@ -330,7 +323,7 @@ jobs:
             tar -xzf $OutputPath -C $env:TEMP
           }
 
-      - name: Locate source directory
+      - name: Locate source
         id: build
         run: |
           $PythonDirs = @(Get-ChildItem $env:TEMP -Directory -Filter "Python-*" -ErrorAction SilentlyContinue)
@@ -347,7 +340,6 @@ jobs:
           & cmd /c "build.bat -d -p ARM64"
           
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          Write-Host "Build successful"
 
       - name: Locate ARM64 executable
         id: exe
@@ -386,8 +378,7 @@ jobs:
         run: |
           mkdir -p release_files
           find release_artifacts -name "*.exe" -exec cp {} release_files/ \;
-          
-          echo "=== Final Release Files ===" 
+          echo "=== Release Files ===" 
           ls -lh release_files/
 
       - name: Upload combined artifacts
@@ -399,14 +390,6 @@ jobs:
 
       - name: Generate summary
         run: |
-          echo "## CPython ${{ needs.prepare.outputs.version }} Build Complete ✓" >> $GITHUB_STEP_SUMMARY
+          echo "## CPython ${{ needs.prepare.outputs.version }} Build Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Source**: ${{ github.event.inputs.source_url }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Generated Executables:" >> $GITHUB_STEP_SUMMARY
-          
-          if [ -d "release_files" ] && [ -n "$(ls -A release_files/)" ]; then
-            ls -1 release_files/ | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- No artifacts generated" >> $GITHUB_STEP_SUMMARY
-          fi
+          [ -d "release_files" ] && ls -1 release_files/ | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY || echo "No artifacts" >> $GITHUB_STEP_SUMMARY
