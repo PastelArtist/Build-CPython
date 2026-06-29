@@ -107,9 +107,13 @@ jobs:
           OUT_NAME="${{ steps.vars.outputs.out_name }}"
           
           mkdir output_artifact
+          
           cp "${BUILD_DIR}/python.exe" "output_artifact/${OUT_NAME}"
           cp ${BUILD_DIR}/*.dll output_artifact/ || true
           cp "${BUILD_DIR}/pythonw.exe" "output_artifact/" || true
+          
+          echo "正在打包标准库 Lib..."
+          cp -r "Python-${VERSION}/Lib" "output_artifact/Lib"
 
       - name: 上传编译产物
         uses: actions/upload-artifact@v7
