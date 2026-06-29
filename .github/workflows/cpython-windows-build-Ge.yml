@@ -12,7 +12,8 @@ on:
 jobs:
   build:
     name: Build ${{ matrix.arch }}
-    runs-on: windows-latest
+    # 【修改 1】：从 windows-latest 降级并固定为 windows-2022，确保稳定的 VS 2022 环境
+    runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +55,6 @@ jobs:
           curl -f -L -A "$UA" -O "${URL}.asc"
           
           echo "正在下载官方公钥文本 (尝试)..."
-          # 允许下载公钥文本失败，因为我们在下一步写了动态追溯公钥的兜底逻辑
           curl -L -A "$UA" -o pubkeys.txt https://www.python.org/static/files/pubkeys.txt || echo "官方公钥包下载失败，启用公钥服务器兜底"
 
       - name: 验证源码签名
@@ -62,7 +62,6 @@ jobs:
         run: |
           FILENAME="${{ steps.vars.outputs.filename }}"
           
-          # 尝试导入下载的公钥文本（如果内容合法）
           if [ -f pubkeys.txt ] && grep -q "BEGIN PGP PUBLIC KEY BLOCK" pubkeys.txt; then
             echo "检测到合法的官方公钥文本，正在导入..."
             gpg --import pubkeys.txt
@@ -70,15 +69,11 @@ jobs:
             echo "未检测到合法的本地公钥文本，将通过签名自动追溯远程公钥..."
           fi
           
-          # 运行一次验证，允许失败，用以捕获该版本对应的 Release Manager Key ID
           VERIFY_OUTPUT=$(gpg --verify "${FILENAME}.asc" "${FILENAME}" 2>&1 || true)
           echo "$VERIFY_OUTPUT"
           
-          # 提取 Key ID (支持 "using RSA key XXXXXX" 格式)
           KEY_ID=$(echo "$VERIFY_OUTPUT" | grep -E "using .* key" | awk '{print $NF}')
-          
           if [ -z "$KEY_ID" ]; then
-            # 备用提取规则
             KEY_ID=$(echo "$VERIFY_OUTPUT" | grep -i "key ID" | awk '{print $NF}')
           fi
           
@@ -101,7 +96,8 @@ jobs:
         run: |
           cd Python-${{ steps.vars.outputs.version }}\PCbuild
           call get_externals.bat
-          call build.bat -p ${{ matrix.arch }} -c Release
+          :: 【修改 2】：追加 /p:PlatformToolset=v143，强制 MSBuild 使用 VS 2022 工具链
+          call build.bat -p ${{ matrix.arch }} -c Release /p:PlatformToolset=v143
 
       - name: 整理输出并重命名 EXE
         shell: bash
