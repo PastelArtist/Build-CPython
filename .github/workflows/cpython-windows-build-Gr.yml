@@ -86,31 +86,27 @@ jobs:
           cd PCbuild
           build.bat -e -p ${{ matrix.build_platform }} -c Release
 
-      - name: Build Installer (with debug)
+      - name: Build Installer
         shell: cmd
         working-directory: ${{ env.PYTHON_SRC }}
         run: |
           cd Tools\msi
-          dir
-          build.bat -${{ matrix.arch_name }} --doc
-          dir en-us
+          build.bat -${{ matrix.arch_name }}
 
-      - name: Collect installer (debug)
+      - name: Collect installer
         shell: pwsh
         run: |
           $src = $env:PYTHON_SRC
-          Write-Host "Looking for installers in $src\Tools\msi"
-          Get-ChildItem -Path "$src\Tools\msi" -Recurse -Filter "*.exe" | Write-Host
-          
           $verMatch = Select-String -Path "$src\Include\patchlevel.h" -Pattern 'PY_VERSION\s+"([^"]+)"'
           $version = if ($verMatch) { $verMatch.Matches.Groups[1].Value } else { "unknown" }
           
           $installer = Get-ChildItem "$src\Tools\msi\en-us" -Filter "python-*.exe" -Recurse | Select-Object -First 1
           if ($installer) {
             Copy-Item $installer.FullName "python-$version${{ matrix.suffix }}.exe" -Force
-            Write-Host "Success: python-$version${{ matrix.suffix }}.exe"
+            Write-Host "Generated: python-$version${{ matrix.suffix }}.exe"
           } else {
-            Write-Warning "No installer found"
+            Write-Warning "No .exe installer found"
+            Get-ChildItem "$src\Tools\msi" -Recurse -Filter "*.exe" | Select-Object FullName
           }
 
       - name: Upload
