@@ -17,110 +17,103 @@ jobs:
       fail-fast: false
     runs-on: windows-latest
     steps:
-      - name: Checkout repository (optional, for scripts if needed)
+      - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Install dependencies (Git, 7z, etc.)
+      - name: Install tools
         shell: pwsh
         run: |
           choco install 7zip -y --no-progress
-          # Git is usually pre-installed
 
-      - name: Download source and signature files
+      - name: Download source
         shell: pwsh
         env:
           SOURCE_URL: ${{ inputs.source_url }}
         run: |
-          $baseName = [System.IO.Path]::GetFileNameWithoutExtension($env:SOURCE_URL)
-          $ext = [System.IO.Path]::GetExtension($env:SOURCE_URL)
+          $uri = [System.Uri]$env:SOURCE_URL
+          $fileName = $uri.Segments[-1]
+          Invoke-WebRequest -Uri $env:SOURCE_URL -OutFile $fileName
           
-          Write-Host "Downloading $env:SOURCE_URL"
-          Invoke-WebRequest -Uri $env:SOURCE_URL -OutFile "Python.tar$ext"
-          
-          # Download associated signature files
-          $sigUrls = @(
-            "$env:SOURCE_URL.sig",
-            "$env:SOURCE_URL.sigstore",
-            "$env:SOURCE_URL.asc"
-          )
-          foreach ($sigUrl in $sigUrls) {
+          # Try to download signatures
+          $base = $fileName -replace '\.tar\.(xz|gz)$',''
+          foreach ($ext in @('.sigstore', '.sig', '.asc')) {
+            $sigUrl = "$env:SOURCE_URL$ext"
             try {
-              Invoke-WebRequest -Uri $sigUrl -OutFile ([System.IO.Path]::GetFileName($sigUrl)) -ErrorAction Stop
-              Write-Host "Downloaded $sigUrl"
-            } catch {
-              Write-Host "No signature file at $sigUrl (expected for some)"
-            }
+              Invoke-WebRequest -Uri $sigUrl -OutFile "$base$ext" -ErrorAction Stop
+              Write-Host "Downloaded signature: $base$ext"
+            } catch { }
           }
 
       - name: Extract source
         shell: pwsh
         run: |
-          if (Test-Path "Python.tar.xz") {
-            7z x Python.tar.xz -so | 7z x -si -ttar -o"Python-src"
-          } elseif (Test-Path "Python.tar.gz" -or Test-Path "Python.tgz") {
-            7z x Python.tar* -so | 7z x -si -ttar -o"Python-src"
+          $tarFiles = Get-ChildItem -Filter "Python*.tar*" 
+          $tarFile = $tarFiles[0]
+          if ($tarFile.Extension -eq '.xz') {
+            7z x $tarFile.Name -so | 7z x -si -ttar -o"Python-src"
           } else {
-            Write-Error "No tarball found"
-            exit 1
+            7z x $tarFile.Name -so | 7z x -si -ttar -o"Python-src"
           }
-          cd Python-src\Python-*
-          $global:PYTHON_SRC = (Get-Location).Path
-          Write-Host "Source extracted to $global:PYTHON_SRC"
+          $srcDir = Get-ChildItem -Path "Python-src" -Directory | Select-Object -First 1
+          $global:PYTHON_SRC = $srcDir.FullName
+          Write-Host "Source at: $global:PYTHON_SRC"
 
-      - name: Verify signature (Sigstore preferred, fallback GPG)
+      - name: Verify signature
         shell: pwsh
         run: |
           cd "$env:PYTHON_SRC\.."
           $tarFile = Get-ChildItem -Filter "Python*.tar*" | Select-Object -First 1
-          if (Test-Path "$tarFile.sigstore") {
+          if (Test-Path "$($tarFile.Name).sigstore") {
             Write-Host "Verifying with Sigstore..."
-            python -m pip install sigstore
-            python -m sigstore verify identity `
-              --bundle "$tarFile.sigstore" `
-              --cert-identity "pablogsal@python.org" `  # Update if key changes
-              --cert-oidc-issuer "https://accounts.google.com" `
-              "$tarFile"
-          } elseif (Test-Path "$tarFile.sig" -or Test-Path "$tarFile.asc") {
-            Write-Host "GPG verification not fully automated here (import key manually if needed)"
-            # gpg --verify ... (requires key import)
+            python -m pip install --quiet sigstore
+            $bundle = "$($tarFile.Name).sigstore"
+            $cmd = "python -m sigstore verify identity --bundle `"$bundle`" --cert-identity `"pablogsal@python.org`" --cert-oidc-issuer `"https://accounts.google.com`" `"$($tarFile.Name)`""
+            Invoke-Expression $cmd
           } else {
-            Write-Warning "No signature file found for verification"
+            Write-Warning "No .sigstore found. Skipping detailed verification."
           }
 
-      - name: Setup build environment (Visual Studio)
+      - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@master
         with:
           arch: ${{ matrix.arch == 'win32' && 'x86' || (matrix.arch == 'amd64' && 'x64' || 'arm64') }}
 
-      - name: Build Python core (PCbuild)
+      - name: Build Python (PCbuild)
         shell: cmd
         working-directory: ${{ env.PYTHON_SRC }}
         run: |
           cd PCbuild
           build.bat -e -p ${{ matrix.arch == 'win32' && 'Win32' || matrix.arch }} -c Release
 
-      - name: Build Windows Installer (MSI/EXE)
+      - name: Build Installer
         shell: cmd
         working-directory: ${{ env.PYTHON_SRC }}
         run: |
           cd Tools\msi
           build.bat -${{ matrix.arch == 'win32' && 'x86' || matrix.arch }} --doc
 
-      - name: Rename and collect artifacts
+      - name: Collect installer
         shell: pwsh
         run: |
-          $version = (Get-Content -Path "${{ env.PYTHON_SRC }}\Include\patchlevel.h" | Select-String 'PY_VERSION' | ForEach-Object { $_.Line -replace '.*"([^"]+)".*', '$1' })
-          $archSuffix = @{
+          $src = "${{ env.PYTHON_SRC }}"
+          $versionMatch = Select-String -Path "$src\Include\patchlevel.h" -Pattern 'PY_VERSION\s+"([^"]+)"'
+          $version = $versionMatch.Matches.Groups[1].Value
+          
+          $suffix = @{
             'win32' = ''
             'amd64' = '-amd64'
             'arm64' = '-arm64'
           }[$env:MATRIX_ARCH]
           
-          $installer = Get-ChildItem -Path "${{ env.PYTHON_SRC }}\Tools\msi\en-us" -Filter "python-*.exe" | Select-Object -First 1
+          $installerDir = Join-Path $src "Tools\msi\en-us"
+          $installer = Get-ChildItem -Path $installerDir -Filter "python-*.exe" | Select-Object -First 1
+          
           if ($installer) {
-            $newName = "python-$version$archSuffix.exe"
-            Copy-Item $installer.FullName -Destination $newName
-            Write-Host "Created $newName"
+            $newName = "python-$version$suffix.exe"
+            Copy-Item $installer.FullName -Destination $newName -Force
+            Write-Host "Installer ready: $newName"
+          } else {
+            Write-Error "Installer not found!"
           }
 
       - name: Upload artifact
