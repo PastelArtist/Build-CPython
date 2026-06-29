@@ -27,54 +27,52 @@ jobs:
         shell: pwsh
         run: choco install 7zip -y --no-progress
 
-      - name: Download source
+      - name: Download & Extract
         shell: pwsh
+        id: extract
         env:
           SOURCE_URL: ${{ inputs.source_url }}
         run: |
           $fileName = Split-Path $env:SOURCE_URL -Leaf
           Invoke-WebRequest -Uri $env:SOURCE_URL -OutFile $fileName
           
+          # Download signatures
           $base = $fileName -replace '\.tar\.(xz|gz|tgz)$',''
-          @('.sigstore','.sig','.asc') | ForEach-Object {
-            try { Invoke-WebRequest -Uri "$env:SOURCE_URL$_" -OutFile "$base$_" } catch {}
-          }
-
-      - name: Extract & Set Path
-        shell: pwsh
-        id: extract
-        run: |
-          $tarFile = Get-ChildItem -Filter "Python*.tar*" | Select-Object -First 1
-          if ($tarFile.Extension -eq '.xz') {
-            7z x $tarFile.Name -so | 7z x -si -ttar -oPython-src
+          @('.sigstore','.sig','.asc') | ForEach-Object { try { Invoke-WebRequest "$env:SOURCE_URL$_" -OutFile "$base$_" } catch {} }
+          
+          # Extract
+          if ($fileName -like "*.xz") {
+            7z x $fileName -so | 7z x -si -ttar -oPython-src
           } else {
-            7z x $tarFile.Name -so | 7z x -si -ttar -oPython-src
+            7z x $fileName -so | 7z x -si -ttar -oPython-src
           }
           
-          $srcDir = Get-ChildItem -Path "Python-src" -Directory | Select-Object -First 1
-          $pythonSrc = $srcDir.FullName
-          echo "PYTHON_SRC=$pythonSrc" >> $env:GITHUB_ENV
-          echo "python_src=$pythonSrc" >> $env:GITHUB_OUTPUT
-          Write-Host "PYTHON_SRC set to: $pythonSrc"
+          $srcDir = Get-ChildItem Python-src -Directory | Select-Object -First 1
+          echo "PYTHON_SRC=$($srcDir.FullName)" >> $env:GITHUB_ENV
 
       - name: Verify signature
         shell: pwsh
         run: |
-          cd "$env:PYTHON_SRC\.."
-          $tarFile = Get-ChildItem -Filter "Python*.tar*" | Select-Object -First 1
-          if (Test-Path "$($tarFile.Name).sigstore") {
+          if (Test-Path "$env:PYTHON_SRC\..\*.sigstore") {
             pip install --quiet sigstore
-            python -m sigstore verify identity `
-              --bundle "$($tarFile.Name).sigstore" `
-              --cert-identity "pablogsal@python.org" `
-              --cert-oidc-issuer "https://accounts.google.com" `
-              "$($tarFile.Name)"
+            $tar = Get-ChildItem "$env:PYTHON_SRC\.." -Filter "Python*.tar*" | Select-Object -First 1
+            python -m sigstore verify identity --bundle "$($tar.Name).sigstore" --cert-identity "pablogsal@python.org" --cert-oidc-issuer "https://accounts.google.com" "$($tar.Name)"
           }
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
           arch: ${{ matrix.arch == 'win32' && 'x86' || (matrix.arch == 'amd64' && 'x64' || 'arm64') }}
+
+      - name: Retarget to current VS toolset
+        shell: pwsh
+        working-directory: ${{ env.PYTHON_SRC }}
+        run: |
+          # Upgrade all .vcxproj to current toolset (v143 or v144)
+          Get-ChildItem -Recurse -Filter "*.vcxproj" | ForEach-Object {
+            (Get-Content $_.FullName) -replace 'v140', 'v143' | Set-Content $_.FullName
+          }
+          Write-Host "Retargeted projects to v143 toolset"
 
       - name: Build Python core
         shell: cmd
@@ -93,18 +91,16 @@ jobs:
       - name: Collect installer
         shell: pwsh
         run: |
-          $versionMatch = Select-String -Path "${{ env.PYTHON_SRC }}\Include\patchlevel.h" -Pattern 'PY_VERSION\s+"([^"]+)"'
+          $versionMatch = Select-String -Path "${env:PYTHON_SRC}\Include\patchlevel.h" -Pattern 'PY_VERSION\s+"([^"]+)"'
           $version = if ($versionMatch) { $versionMatch.Matches.Groups[1].Value } else { "unknown" }
-          
           $suffix = @{win32=''; amd64='-amd64'; arm64='-arm64'}[$env:MATRIX_ARCH]
-          $installer = Get-ChildItem -Path "${{ env.PYTHON_SRC }}\Tools\msi\en-us" -Filter "*.exe" -Recurse | Select-Object -First 1
           
+          $installer = Get-ChildItem "${env:PYTHON_SRC}\Tools\msi\en-us" -Filter "python-*.exe" -Recurse | Select-Object -First 1
           if ($installer) {
-            Copy-Item $installer.FullName -Destination "python-$version$suffix.exe" -Force
-            Write-Host "Created: python-$version$suffix.exe"
+            Copy-Item $installer.FullName "python-$version$suffix.exe" -Force
           }
 
-      - name: Upload
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: python-installer-${{ matrix.arch }}
