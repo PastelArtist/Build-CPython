@@ -26,12 +26,9 @@ jobs:
         id: extract
         run: |
           URL="${{ github.event.inputs.source_url }}"
-          
-          # Extract archive name from URL
           ARCHIVE_NAME=$(basename "$URL")
           echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
           
-          # Determine archive type
           if [[ "$ARCHIVE_NAME" == *.tar.xz ]]; then
             ARCHIVE_TYPE="tar.xz"
           elif [[ "$ARCHIVE_NAME" == *.tgz ]]; then
@@ -42,12 +39,10 @@ jobs:
           fi
           echo "archive_type=$ARCHIVE_TYPE" >> $GITHUB_OUTPUT
           
-          # Extract version (e.g., 3.11.15 from Python-3.11.15.tar.xz)
           VERSION=$(echo "$ARCHIVE_NAME" | sed -E 's/Python-([0-9]+\.[0-9]+\.[0-9]+)\.(tar\.xz|tgz)/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           
           echo "Archive: $ARCHIVE_NAME"
-          echo "Type: $ARCHIVE_TYPE"
           echo "Version: $VERSION"
 
   download-and-verify:
@@ -60,40 +55,27 @@ jobs:
           wget -q "${{ github.event.inputs.source_url }}"
           echo "Downloaded: $(ls -lh $(basename ${{ github.event.inputs.source_url }}))"
 
-      - name: Download GPG signature and certificate
+      - name: Download GPG signature
         run: |
           cd /tmp
           ARCHIVE_NAME=$(basename "${{ github.event.inputs.source_url }}")
           BASE_URL="${{ github.event.inputs.source_url }}"
           BASE_URL="${BASE_URL%/*}"
           
-          # Download .asc file
           wget -q "$BASE_URL/$ARCHIVE_NAME.asc" || echo "No .asc file found"
-          
-          # Download .asc.sig file if available
-          wget -q "$BASE_URL/$ARCHIVE_NAME.asc.sig" || true
-          
-          ls -lh $ARCHIVE_NAME* 2>/dev/null | head -20
+          ls -lh $ARCHIVE_NAME* 2>/dev/null
 
       - name: Import GPG keys from keyserver
         run: |
-          # Import all possible Python Release Signing Keys
           echo "Importing GPG keys..."
           
-          # Key for recent releases (3.11+)
           gpg --keyserver keys.openpgp.org --recv-keys CFDCA245B1043CF2A5F97865FFE87404168BD847 2>&1 || \
-          gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys CFDCA245B1043CF2A5F97865FFE87404168BD847 2>&1 || \
-          echo "Trying alternate key servers..."
+          gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys CFDCA245B1043CF2A5F97865FFE87404168BD847 2>&1 || true
           
-          # Fallback: Try other known Python release keys
           gpg --keyserver keys.openpgp.org --recv-keys \
             0D96DF4D4110E5C1A2A4B132C3A8495E0E31E23B \
             E8AC80D7A454B8403413E8521C4EB3FE58C6E5C6 \
-            A821E680E5F81405F7BF06D3FEB907C925FFFC99 \
-            6E3CBCC4F1D7B6885BEAFC36C50E9CDE82C78001 2>&1 || true
-          
-          echo "Available keys:"
-          gpg --list-keys 2>/dev/null | grep -E "^pub|uid" || echo "No keys found"
+            A821E680E5F81405F7BF06D3FEB907C925FFFC99 2>&1 || true
 
       - name: Verify GPG signature
         if: github.event.inputs.verify_signature == 'true'
@@ -103,24 +85,14 @@ jobs:
           ARCHIVE_NAME=$(basename "${{ github.event.inputs.source_url }}")
           
           if [ -f "$ARCHIVE_NAME.asc" ]; then
-            echo "Verifying with .asc file..."
-            if gpg --verify "$ARCHIVE_NAME.asc" "$ARCHIVE_NAME" 2>&1; then
-              echo "✓ Signature verification successful"
-              exit 0
-            else
-              echo "⚠ Signature verification failed but continuing..."
-              exit 0
-            fi
-          else
-            echo "⚠ No .asc signature file found"
-            exit 0
+            echo "Verifying signature..."
+            gpg --verify "$ARCHIVE_NAME.asc" "$ARCHIVE_NAME" || true
           fi
 
       - name: Calculate source hash
         run: |
           cd /tmp
           ARCHIVE_NAME=$(basename "${{ github.event.inputs.source_url }}")
-          echo "SHA256 Checksum:"
           sha256sum "$ARCHIVE_NAME"
 
   build-x86:
@@ -136,114 +108,91 @@ jobs:
           Write-Host "Downloading from: $SourceUrl"
           Invoke-WebRequest -Uri $SourceUrl -OutFile $OutputPath -UseBasicParsing
           Write-Host "Downloaded: $ArchiveName"
-          Write-Host "Size: $((Get-Item $OutputPath).Length / 1MB) MB"
 
       - name: Extract source
         run: |
           $ArchiveName = Split-Path -Leaf "${{ github.event.inputs.source_url }}"
           $OutputPath = Join-Path $env:TEMP $ArchiveName
-          $ExtractDir = $env:TEMP
-          
-          Write-Host "Archive: $ArchiveName"
-          Write-Host "Extract location: $ExtractDir"
           
           if ($ArchiveName -like "*.tar.xz") {
-            Write-Host "Extracting tar.xz archive..."
-            tar -xf $OutputPath -C $ExtractDir
+            tar -xf $OutputPath -C $env:TEMP
           } elseif ($ArchiveName -like "*.tgz") {
-            Write-Host "Extracting tgz archive..."
-            tar -xzf $OutputPath -C $ExtractDir
+            tar -xzf $OutputPath -C $env:TEMP
           }
-          
-          # List extracted directories
-          Write-Host "Extracted contents:"
-          Get-ChildItem $ExtractDir -Directory | Where-Object {$_.Name -like "Python-*"} | Select-Object -First 5
 
       - name: Locate CPython source directory
         id: source
         run: |
           $PythonDirs = @(Get-ChildItem $env:TEMP -Directory -Filter "Python-*" -ErrorAction SilentlyContinue)
-          
           if ($PythonDirs.Count -eq 0) {
-            Write-Host "ERROR: No Python-* directory found in $env:TEMP"
-            Get-ChildItem $env:TEMP -Directory | Select-Object Name | Head -20
+            Write-Host "ERROR: No Python-* directory found"
             exit 1
           }
           
           $SourceDir = $PythonDirs[0].FullName
-          Write-Host "Found source directory: $SourceDir"
-          Write-Host "source_dir=$SourceDir" >> $env:GITHUB_OUTPUT
-          
-          # Verify PCbuild exists
-          $PcbuildDir = Join-Path $SourceDir "PCbuild"
-          if (Test-Path $PcbuildDir) {
-            Write-Host "✓ PCbuild directory found"
-          } else {
-            Write-Host "ERROR: PCbuild directory not found at $PcbuildDir"
-            Get-ChildItem $SourceDir | Select-Object Name
-            exit 1
-          }
+          Write-Host "Found source: $SourceDir"
+          echo "source_dir=$SourceDir" >> $env:GITHUB_OUTPUT
 
-      - name: Setup build environment
-        run: |
-          Write-Host "Python version:"
-          python --version
-          
-          Write-Host "Visual Studio information:"
-          & 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat' -arch=x86
-          cl.exe
-
-      - name: Build CPython x86
-        shell: cmd
-        run: |
-          setlocal enabledelayedexpansion
-          
-          cd /D "${{ steps.source.outputs.source_dir }}\PCbuild"
-          
-          echo Building x86 (Win32) version...
-          call build.bat -d -p Win32
-          
-          if !ERRORLEVEL! neq 0 (
-            echo ERROR: x86 build failed
-            exit /b 1
-          )
-          
-          echo Build successful
-
-      - name: Prepare x86 executable
+      - name: Build CPython x86 (Win32)
         run: |
           $SourceDir = "${{ steps.source.outputs.source_dir }}"
           $PcbuildDir = Join-Path $SourceDir "PCbuild"
-          $Version = "${{ needs.prepare.outputs.version }}"
           
-          # Look for python executable in various possible locations
-          $PossiblePaths = @(
+          Write-Host "Building x86 (Win32)..."
+          cd $PcbuildDir
+          
+          # Run build.bat with release mode and Win32 platform
+          & cmd /c "build.bat -d -p Win32"
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Build failed with exit code: $LASTEXITCODE"
+            exit 1
+          }
+          Write-Host "Build completed successfully"
+
+      - name: Locate x86 python.exe
+        id: exe_x86
+        run: |
+          $SourceDir = "${{ steps.source.outputs.source_dir }}"
+          $PcbuildDir = Join-Path $SourceDir "PCbuild"
+          
+          # Search for python.exe in common build output locations
+          $SearchPaths = @(
             (Join-Path $PcbuildDir "win32\python.exe"),
             (Join-Path $PcbuildDir "win32\Release\python.exe"),
             (Join-Path $PcbuildDir "win32\Debug\python.exe"),
-            (Join-Path $PcbuildDir "python.exe")
+            (Join-Path $PcbuildDir "amd64\python.exe"),
+            (Join-Path $PcbuildDir "amd64\Release\python.exe")
           )
           
           $ExePath = $null
-          foreach ($path in $PossiblePaths) {
+          foreach ($path in $SearchPaths) {
             if (Test-Path $path) {
               $ExePath = $path
-              Write-Host "Found executable at: $ExePath"
+              Write-Host "Found: $ExePath"
               break
             }
           }
           
           if (-not $ExePath) {
-            Write-Host "ERROR: python.exe not found in expected locations"
-            Write-Host "Searching for all python.exe files:"
-            Get-ChildItem $PcbuildDir -Recurse -Filter "python.exe" -ErrorAction SilentlyContinue
+            Write-Host "Searching for all python.exe files..."
+            Get-ChildItem $PcbuildDir -Recurse -Filter "python.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "Available: $($_.FullName)"
+            }
             exit 1
           }
           
+          echo "exe_path=$ExePath" >> $env:GITHUB_OUTPUT
+
+      - name: Copy x86 executable
+        run: |
+          $ExePath = "${{ steps.exe_x86.outputs.exe_path }}"
+          $Version = "${{ needs.prepare.outputs.version }}"
           $OutputName = "python-$Version.exe"
+          
           Copy-Item $ExePath $OutputName -Force
           Write-Host "Created: $OutputName"
-          Get-Item $OutputName | Select-Object Name, Length
+          Get-Item $OutputName | Format-List Name, Length
 
       - name: Upload x86 artifact
         uses: actions/upload-artifact@v4
@@ -261,119 +210,81 @@ jobs:
           $SourceUrl = "${{ github.event.inputs.source_url }}"
           $ArchiveName = Split-Path -Leaf $SourceUrl
           $OutputPath = Join-Path $env:TEMP $ArchiveName
-          
-          Write-Host "Downloading from: $SourceUrl"
           Invoke-WebRequest -Uri $SourceUrl -OutFile $OutputPath -UseBasicParsing
-          Write-Host "Downloaded: $ArchiveName"
-          Write-Host "Size: $((Get-Item $OutputPath).Length / 1MB) MB"
 
       - name: Extract source
         run: |
           $ArchiveName = Split-Path -Leaf "${{ github.event.inputs.source_url }}"
           $OutputPath = Join-Path $env:TEMP $ArchiveName
-          $ExtractDir = $env:TEMP
-          
-          Write-Host "Archive: $ArchiveName"
-          Write-Host "Extract location: $ExtractDir"
           
           if ($ArchiveName -like "*.tar.xz") {
-            Write-Host "Extracting tar.xz archive..."
-            tar -xf $OutputPath -C $ExtractDir
+            tar -xf $OutputPath -C $env:TEMP
           } elseif ($ArchiveName -like "*.tgz") {
-            Write-Host "Extracting tgz archive..."
-            tar -xzf $OutputPath -C $ExtractDir
+            tar -xzf $OutputPath -C $env:TEMP
           }
-          
-          # List extracted directories
-          Write-Host "Extracted contents:"
-          Get-ChildItem $ExtractDir -Directory | Where-Object {$_.Name -like "Python-*"} | Select-Object -First 5
 
       - name: Locate CPython source directory
         id: source
         run: |
           $PythonDirs = @(Get-ChildItem $env:TEMP -Directory -Filter "Python-*" -ErrorAction SilentlyContinue)
-          
-          if ($PythonDirs.Count -eq 0) {
-            Write-Host "ERROR: No Python-* directory found in $env:TEMP"
-            Get-ChildItem $env:TEMP -Directory | Select-Object Name | Head -20
-            exit 1
-          }
-          
-          $SourceDir = $PythonDirs[0].FullName
-          Write-Host "Found source directory: $SourceDir"
-          Write-Host "source_dir=$SourceDir" >> $env:GITHUB_OUTPUT
-          
-          # Verify PCbuild exists
-          $PcbuildDir = Join-Path $SourceDir "PCbuild"
-          if (Test-Path $PcbuildDir) {
-            Write-Host "✓ PCbuild directory found"
-          } else {
-            Write-Host "ERROR: PCbuild directory not found at $PcbuildDir"
-            Get-ChildItem $SourceDir | Select-Object Name
-            exit 1
-          }
-
-      - name: Setup build environment
-        run: |
-          Write-Host "Python version:"
-          python --version
-          
-          Write-Host "Visual Studio information:"
-          & 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat' -arch=x64
-          cl.exe
+          if ($PythonDirs.Count -eq 0) { exit 1 }
+          echo "source_dir=$($PythonDirs[0].FullName)" >> $env:GITHUB_OUTPUT
 
       - name: Build CPython x64
-        shell: cmd
-        run: |
-          setlocal enabledelayedexpansion
-          
-          cd /D "${{ steps.source.outputs.source_dir }}\PCbuild"
-          
-          echo Building x64 version...
-          call build.bat -d -p x64
-          
-          if !ERRORLEVEL! neq 0 (
-            echo ERROR: x64 build failed
-            exit /b 1
-          )
-          
-          echo Build successful
-
-      - name: Prepare x64 executable
         run: |
           $SourceDir = "${{ steps.source.outputs.source_dir }}"
           $PcbuildDir = Join-Path $SourceDir "PCbuild"
-          $Version = "${{ needs.prepare.outputs.version }}"
           
-          # Look for python executable in various possible locations
-          $PossiblePaths = @(
+          Write-Host "Building x64..."
+          cd $PcbuildDir
+          
+          & cmd /c "build.bat -d -p x64"
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Build failed"
+            exit 1
+          }
+
+      - name: Locate x64 python.exe
+        id: exe_x64
+        run: |
+          $SourceDir = "${{ steps.source.outputs.source_dir }}"
+          $PcbuildDir = Join-Path $SourceDir "PCbuild"
+          
+          $SearchPaths = @(
             (Join-Path $PcbuildDir "amd64\python.exe"),
             (Join-Path $PcbuildDir "amd64\Release\python.exe"),
             (Join-Path $PcbuildDir "amd64\Debug\python.exe"),
-            (Join-Path $PcbuildDir "x64\python.exe"),
-            (Join-Path $PcbuildDir "python.exe")
+            (Join-Path $PcbuildDir "x64\python.exe")
           )
           
           $ExePath = $null
-          foreach ($path in $PossiblePaths) {
+          foreach ($path in $SearchPaths) {
             if (Test-Path $path) {
               $ExePath = $path
-              Write-Host "Found executable at: $ExePath"
+              Write-Host "Found: $ExePath"
               break
             }
           }
           
           if (-not $ExePath) {
-            Write-Host "ERROR: python.exe not found in expected locations"
-            Write-Host "Searching for all python.exe files:"
-            Get-ChildItem $PcbuildDir -Recurse -Filter "python.exe" -ErrorAction SilentlyContinue
+            Write-Host "Searching for all python.exe files..."
+            Get-ChildItem $PcbuildDir -Recurse -Filter "python.exe" | ForEach-Object {
+              Write-Host "Available: $($_.FullName)"
+            }
             exit 1
           }
           
+          echo "exe_path=$ExePath" >> $env:GITHUB_OUTPUT
+
+      - name: Copy x64 executable
+        run: |
+          $ExePath = "${{ steps.exe_x64.outputs.exe_path }}"
+          $Version = "${{ needs.prepare.outputs.version }}"
           $OutputName = "python-$Version-amd64.exe"
+          
           Copy-Item $ExePath $OutputName -Force
           Write-Host "Created: $OutputName"
-          Get-Item $OutputName | Select-Object Name, Length
 
       - name: Upload x64 artifact
         uses: actions/upload-artifact@v4
@@ -391,118 +302,80 @@ jobs:
           $SourceUrl = "${{ github.event.inputs.source_url }}"
           $ArchiveName = Split-Path -Leaf $SourceUrl
           $OutputPath = Join-Path $env:TEMP $ArchiveName
-          
-          Write-Host "Downloading from: $SourceUrl"
           Invoke-WebRequest -Uri $SourceUrl -OutFile $OutputPath -UseBasicParsing
-          Write-Host "Downloaded: $ArchiveName"
-          Write-Host "Size: $((Get-Item $OutputPath).Length / 1MB) MB"
 
       - name: Extract source
         run: |
           $ArchiveName = Split-Path -Leaf "${{ github.event.inputs.source_url }}"
           $OutputPath = Join-Path $env:TEMP $ArchiveName
-          $ExtractDir = $env:TEMP
-          
-          Write-Host "Archive: $ArchiveName"
-          Write-Host "Extract location: $ExtractDir"
           
           if ($ArchiveName -like "*.tar.xz") {
-            Write-Host "Extracting tar.xz archive..."
-            tar -xf $OutputPath -C $ExtractDir
+            tar -xf $OutputPath -C $env:TEMP
           } elseif ($ArchiveName -like "*.tgz") {
-            Write-Host "Extracting tgz archive..."
-            tar -xzf $OutputPath -C $ExtractDir
+            tar -xzf $OutputPath -C $env:TEMP
           }
-          
-          # List extracted directories
-          Write-Host "Extracted contents:"
-          Get-ChildItem $ExtractDir -Directory | Where-Object {$_.Name -like "Python-*"} | Select-Object -First 5
 
       - name: Locate CPython source directory
         id: source
         run: |
           $PythonDirs = @(Get-ChildItem $env:TEMP -Directory -Filter "Python-*" -ErrorAction SilentlyContinue)
-          
-          if ($PythonDirs.Count -eq 0) {
-            Write-Host "ERROR: No Python-* directory found in $env:TEMP"
-            Get-ChildItem $env:TEMP -Directory | Select-Object Name | Head -20
-            exit 1
-          }
-          
-          $SourceDir = $PythonDirs[0].FullName
-          Write-Host "Found source directory: $SourceDir"
-          Write-Host "source_dir=$SourceDir" >> $env:GITHUB_OUTPUT
-          
-          # Verify PCbuild exists
-          $PcbuildDir = Join-Path $SourceDir "PCbuild"
-          if (Test-Path $PcbuildDir) {
-            Write-Host "✓ PCbuild directory found"
-          } else {
-            Write-Host "ERROR: PCbuild directory not found at $PcbuildDir"
-            Get-ChildItem $SourceDir | Select-Object Name
-            exit 1
-          }
-
-      - name: Setup build environment
-        run: |
-          Write-Host "Python version:"
-          python --version
-          
-          Write-Host "Visual Studio information:"
-          & 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat' -arch=arm64
-          cl.exe
+          if ($PythonDirs.Count -eq 0) { exit 1 }
+          echo "source_dir=$($PythonDirs[0].FullName)" >> $env:GITHUB_OUTPUT
 
       - name: Build CPython ARM64
-        shell: cmd
-        run: |
-          setlocal enabledelayedexpansion
-          
-          cd /D "${{ steps.source.outputs.source_dir }}\PCbuild"
-          
-          echo Building ARM64 version...
-          call build.bat -d -p ARM64
-          
-          if !ERRORLEVEL! neq 0 (
-            echo ERROR: ARM64 build failed
-            exit /b 1
-          )
-          
-          echo Build successful
-
-      - name: Prepare ARM64 executable
         run: |
           $SourceDir = "${{ steps.source.outputs.source_dir }}"
           $PcbuildDir = Join-Path $SourceDir "PCbuild"
-          $Version = "${{ needs.prepare.outputs.version }}"
           
-          # Look for python executable in various possible locations
-          $PossiblePaths = @(
+          Write-Host "Building ARM64..."
+          cd $PcbuildDir
+          
+          & cmd /c "build.bat -d -p ARM64"
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Build failed"
+            exit 1
+          }
+
+      - name: Locate ARM64 python.exe
+        id: exe_arm64
+        run: |
+          $SourceDir = "${{ steps.source.outputs.source_dir }}"
+          $PcbuildDir = Join-Path $SourceDir "PCbuild"
+          
+          $SearchPaths = @(
             (Join-Path $PcbuildDir "arm64\python.exe"),
             (Join-Path $PcbuildDir "arm64\Release\python.exe"),
-            (Join-Path $PcbuildDir "arm64\Debug\python.exe"),
-            (Join-Path $PcbuildDir "python.exe")
+            (Join-Path $PcbuildDir "arm64\Debug\python.exe")
           )
           
           $ExePath = $null
-          foreach ($path in $PossiblePaths) {
+          foreach ($path in $SearchPaths) {
             if (Test-Path $path) {
               $ExePath = $path
-              Write-Host "Found executable at: $ExePath"
+              Write-Host "Found: $ExePath"
               break
             }
           }
           
           if (-not $ExePath) {
-            Write-Host "ERROR: python.exe not found in expected locations"
-            Write-Host "Searching for all python.exe files:"
-            Get-ChildItem $PcbuildDir -Recurse -Filter "python.exe" -ErrorAction SilentlyContinue
+            Write-Host "Searching for all python.exe files..."
+            Get-ChildItem $PcbuildDir -Recurse -Filter "python.exe" | ForEach-Object {
+              Write-Host "Available: $($_.FullName)"
+            }
             exit 1
           }
           
+          echo "exe_path=$ExePath" >> $env:GITHUB_OUTPUT
+
+      - name: Copy ARM64 executable
+        run: |
+          $ExePath = "${{ steps.exe_arm64.outputs.exe_path }}"
+          $Version = "${{ needs.prepare.outputs.version }}"
           $OutputName = "python-$Version-arm64.exe"
+          
           Copy-Item $ExePath $OutputName -Force
           Write-Host "Created: $OutputName"
-          Get-Item $OutputName | Select-Object Name, Length
 
       - name: Upload ARM64 artifact
         uses: actions/upload-artifact@v4
@@ -521,62 +394,20 @@ jobs:
         with:
           path: release_artifacts
 
-      - name: Organize and verify artifacts
+      - name: Organize artifacts
         run: |
           mkdir -p release_files
           
-          cd release_artifacts
+          echo "=== All downloaded artifacts ==="
+          find release_artifacts -type f -name "*.exe" -exec ls -lh {} \;
           
-          # Count successful builds
-          SUCCESS=0
-          
-          # Copy x86 executable
-          if find . -name "python-*-x86*" -o -name "python-*.exe" | grep -v amd64 | grep -v arm64 | head -1 | xargs -I {} cp {} ../release_files/ 2>/dev/null; then
-            echo "✓ x86 executable ready"
-            ((SUCCESS++))
-          fi
-          
-          # Copy x64 executable
-          if find . -name "*amd64.exe" -o -name "*x64*.exe" | head -1 | xargs -I {} cp {} ../release_files/ 2>/dev/null; then
-            echo "✓ x64 executable ready"
-            ((SUCCESS++))
-          fi
-          
-          # Copy ARM64 executable
-          if find . -name "*arm64.exe" | head -1 | xargs -I {} cp {} ../release_files/ 2>/dev/null; then
-            echo "✓ ARM64 executable ready"
-            ((SUCCESS++))
-          fi
-          
-          cd ../release_files
           echo ""
-          echo "=== Build Summary ==="
-          echo "Successful builds: $SUCCESS/3"
+          echo "=== Copying to release_files ==="
+          find release_artifacts -type f -name "*.exe" -exec cp {} release_files/ \;
+          
           echo ""
-          echo "=== Release Files ==="
-          ls -lh
-
-      - name: Create release notes
-        run: |
-          cat > release_notes.md << 'EOF'
-          # CPython ${{ needs.prepare.outputs.version }} Windows Builds
-          
-          **Source**: ${{ github.event.inputs.source_url }}
-          
-          **Build Date**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
-          
-          ## Executables
-          
-          - **python-${{ needs.prepare.outputs.version }}.exe** - x86 (32-bit)
-          - **python-${{ needs.prepare.outputs.version }}-amd64.exe** - x64 (64-bit)
-          - **python-${{ needs.prepare.outputs.version }}-arm64.exe** - ARM64 (64-bit)
-          
-          ## Build Information
-          
-          Built using official CPython Windows build system (PCbuild).
-          
-          EOF
-          cat release_notes.md
+          echo "=== Final Release Files ==="
+          ls -lh release_files/
 
       - name: Upload combined artifacts
         uses: actions/upload-artifact@v4
@@ -588,16 +419,14 @@ jobs:
       - name: Generate summary
         if: always()
         run: |
-          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## CPython ${{ needs.prepare.outputs.version }} Build Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Version**: ${{ needs.prepare.outputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "**Source**: ${{ github.event.inputs.source_url }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Generated Executables:" >> $GITHUB_STEP_SUMMARY
           
-          if [ -d "release_files" ]; then
-            echo "### Artifacts Generated" >> $GITHUB_STEP_SUMMARY
-            ls -1 release_files/ | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY
+          if [ -d "release_files" ] && [ -n "$(ls -A release_files/)" ]; then
+            ls -1 release_files/ | sed 's/^/- /'  >> $GITHUB_STEP_SUMMARY
           else
-            echo "### Build Status" >> $GITHUB_STEP_SUMMARY
-            echo "Check job logs for details" >> $GITHUB_STEP_SUMMARY
+            echo "No executables generated - check job logs" >> $GITHUB_STEP_SUMMARY
           fi
